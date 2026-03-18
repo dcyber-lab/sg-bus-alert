@@ -9,6 +9,18 @@ import { promisify } from "node:util";
 const ENV_PATH = path.join(process.cwd(), ".env");
 const execFileAsync = promisify(execFile);
 
+function logInfo(message) {
+  console.log(`[sg-bus-alert] ${message}`);
+}
+
+function isIgnorableTelegramError(message) {
+  return (
+    message.includes("query is too old") ||
+    message.includes("query ID is invalid") ||
+    message.includes("message is not modified")
+  );
+}
+
 function parseEnvFile(text) {
   const env = {};
   for (const rawLine of text.split(/\r?\n/)) {
@@ -109,6 +121,21 @@ function isWithinWindow(date, timeZone, start, end) {
   return currentMinute >= getMinuteOfDay(start) && currentMinute <= getMinuteOfDay(end);
 }
 
+function formatLocalDateTime(date, timeZone) {
+  const formatter = new Intl.DateTimeFormat("zh-CN", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+
+  return formatter.format(date);
+}
+
 function loadLabel(code) {
   switch (code) {
     case "SEA":
@@ -171,6 +198,38 @@ function formatDateKey(date, timeZone) {
   });
 
   return formatter.format(date);
+}
+
+function cloneStops(stops) {
+  return JSON.parse(JSON.stringify(stops));
+}
+
+function loadEffectiveStops(state, defaultStops) {
+  if (Array.isArray(state.monitoredStops) && state.monitoredStops.length > 0) {
+    return cloneStops(state.monitoredStops);
+  }
+  return cloneStops(defaultStops);
+}
+
+function getServiceThresholdMinutes(state, envDefaultMinutes, serviceNo) {
+  const overrides = state.serviceThresholdMinutes || {};
+  const override = overrides[serviceNo];
+  if (typeof override === "number" && Number.isFinite(override)) {
+    return override;
+  }
+  return envDefaultMinutes;
+}
+
+function normalizeText(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function findStopByIdentifier(stops, identifier) {
+  const query = normalizeText(identifier);
+  return (
+    stops.find((stop) => normalizeText(stop.stop_id) === query) ||
+    stops.find((stop) => normalizeText(stop.stop_name) === query)
+  );
 }
 
 function weatherCodeLabel(code) {
@@ -287,6 +346,24 @@ async function sendTelegram(token, chatId, text) {
   });
 }
 
+function buildTelegramButtons(isMuted) {
+  return {
+    inline_keyboard: [
+      [
+        { text: "🚏 查看状态", callback_data: "status_all" },
+        { text: "🚌 189", callback_data: "status_189" },
+        { text: "🚌 963", callback_data: "status_963" },
+      ],
+      isMuted
+        ? [{ text: "🔔 恢复提醒", callback_data: "resume" }]
+        : [
+            { text: "🛑 我上车了", callback_data: "boarded" },
+            { text: "🔕 暂停今天", callback_data: "mute" },
+          ],
+    ],
+  };
+}
+
 async function sendTelegramMessage(token, payload) {
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   const response = await fetch(url, {
@@ -300,6 +377,82 @@ async function sendTelegramMessage(token, payload) {
   if (!response.ok) {
     const body = await response.text();
     throw new Error(`Telegram send failed: ${response.status} ${response.statusText} ${body}`);
+  }
+}
+
+async function answerTelegramCallbackQuery(token, callbackQueryId, text = "") {
+  const url = `https://api.telegram.org/bot${token}/answerCallbackQuery`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      callback_query_id: callbackQueryId,
+      text,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    const message = `Telegram answerCallbackQuery failed: ${response.status} ${response.statusText} ${body}`;
+    if (isIgnorableTelegramError(message)) {
+      logInfo(message);
+      return;
+    }
+    throw new Error(message);
+  }
+}
+
+async function editTelegramMessageReplyMarkup(token, chatId, messageId, replyMarkup) {
+  const url = `https://api.telegram.org/bot${token}/editMessageReplyMarkup`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: replyMarkup,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    const message = `Telegram editMessageReplyMarkup failed: ${response.status} ${response.statusText} ${body}`;
+    if (isIgnorableTelegramError(message)) {
+      logInfo(message);
+      return;
+    }
+    throw new Error(message);
+  }
+}
+
+async function editTelegramMessageText(token, chatId, messageId, text, replyMarkup) {
+  const url = `https://api.telegram.org/bot${token}/editMessageText`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      disable_web_page_preview: true,
+      reply_markup: replyMarkup,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    const message = `Telegram editMessageText failed: ${response.status} ${response.statusText} ${body}`;
+    if (isIgnorableTelegramError(message)) {
+      logInfo(message);
+      return;
+    }
+    throw new Error(message);
   }
 }
 
@@ -361,7 +514,7 @@ function buildStatusLine(stopName, serviceNo, arrivals, timeZone) {
 }
 
 function buildStatusMessage(items, timeZone, weatherSummary = null, muteStatus = null) {
-  const lines = ["🚏 当前公交状态", ""];
+  const lines = ["🚏 手动查询状态", ""];
 
   if (muteStatus) {
     lines.push(muteStatus);
@@ -388,12 +541,35 @@ function buildStatusMessage(items, timeZone, weatherSummary = null, muteStatus =
 
   lines.push("");
   lines.push(`更新时间：${formatArrivalClock(new Date().toISOString(), timeZone)}`);
-  lines.push(`可发送：状态 / 189 / 963 / 上车了 / 暂停 / 恢复`);
+  lines.push(`可发送：状态 / 189 / 963 / 上车了 / 暂停 / 恢复 / 配置`);
+  return lines.join("\n");
+}
+
+function buildConfigMessage(stops, state, defaultThresholdMinutes) {
+  const lines = ["⚙️ 当前配置", ""];
+
+  for (const stop of stops) {
+    lines.push(`📍 ${stop.stop_name} (${stop.stop_id})`);
+    if (!Array.isArray(stop.services) || stop.services.length === 0) {
+      lines.push("   暂无监控线路");
+    } else {
+      for (const serviceNo of stop.services) {
+        const threshold = getServiceThresholdMinutes(state, defaultThresholdMinutes, serviceNo);
+        lines.push(`   🚌 ${serviceNo}｜提醒阈值 ${threshold} 分钟`);
+      }
+    }
+    lines.push("");
+  }
+
+  lines.push("可发送：");
+  lines.push("添加线路 190");
+  lines.push("删除线路 963");
+  lines.push("阈值 189 6");
   return lines.join("\n");
 }
 
 function buildMorningAlertMessage(items, timeZone, weatherSummary = null) {
-  const lines = ["⏰ 晨间通知", ""];
+  const lines = ["⏰ 早高峰主动提醒", ""];
 
   if (weatherSummary) {
     lines.push(weatherSummary);
@@ -415,6 +591,26 @@ function buildMorningAlertMessage(items, timeZone, weatherSummary = null) {
   lines.push("⚡ 可以准备出门了");
   lines.push(`更新时间：${formatArrivalClock(new Date().toISOString(), timeZone)}`);
   return lines.join("\n");
+}
+
+function applyMuteBannerToMessageText(text, isMuted) {
+  const lines = String(text || "").split("\n");
+  const filtered = lines.filter(
+    (line) => line !== "🔕 今天已暂停" && line !== "🔔 今天的主动提醒：开启中",
+  );
+
+  if (
+    filtered.length >= 2 &&
+    (filtered[0] === "🚏 当前公交状态" ||
+      filtered[0] === "🚏 手动查询状态" ||
+      filtered[0] === "⏰ 晨间通知" ||
+      filtered[0] === "⏰ 早高峰主动提醒") &&
+    filtered[1] === ""
+  ) {
+    filtered.splice(2, 0, isMuted ? "🔕 今天已暂停" : "🔔 今天的主动提醒：开启中", "");
+  }
+
+  return filtered.join("\n");
 }
 
 function selectArrival(service, maxMinutes) {
@@ -479,7 +675,30 @@ async function fetchCurrentStatuses(apiBase, stops, timeZone, requestedServices 
   return items;
 }
 
-async function processTelegramCommands(token, chatId, state, apiBase, stops, timeZone, weatherConfig) {
+async function discoverServiceCandidateStops(apiBase, stops, serviceNo) {
+  const candidates = [];
+
+  for (const stop of stops) {
+    const arrivalData = await fetchArrivals(apiBase, stop.stop_id);
+    const services = arrivalData.services || [];
+    if (services.some((service) => service.no === serviceNo)) {
+      candidates.push(stop);
+    }
+  }
+
+  return candidates;
+}
+
+async function processTelegramCommands(
+  token,
+  chatId,
+  state,
+  apiBase,
+  stops,
+  timeZone,
+  weatherConfig,
+  defaultThresholdMinutes,
+) {
   const offset =
     typeof state.telegramUpdateOffset === "number" ? state.telegramUpdateOffset : undefined;
   const updates = await fetchTelegramUpdates(token, offset);
@@ -487,12 +706,37 @@ async function processTelegramCommands(token, chatId, state, apiBase, stops, tim
   for (const update of updates) {
     state.telegramUpdateOffset = update.update_id + 1;
 
-    const message = update.message;
+    const message = update.message || update.callback_query?.message;
+    const callbackQuery = update.callback_query;
     if (!message || !message.chat || String(message.chat.id) !== String(chatId)) {
       continue;
     }
 
-    const text = (message.text || "").trim();
+    let text = (message.text || "").trim();
+    if (callbackQuery) {
+      switch (callbackQuery.data) {
+        case "status_all":
+          text = "状态";
+          break;
+        case "status_189":
+          text = "189";
+          break;
+        case "status_963":
+          text = "963";
+          break;
+        case "boarded":
+          text = "上车了";
+          break;
+        case "mute":
+          text = "暂停";
+          break;
+        case "resume":
+          text = "恢复";
+          break;
+        default:
+          text = "";
+      }
+    }
     if (!text) {
       continue;
     }
@@ -502,33 +746,220 @@ async function processTelegramCommands(token, chatId, state, apiBase, stops, tim
 
     if (text === "上车了" || text === "暂停") {
       state.mutedUntilDateKey = todayKey;
-      await sendTelegramMessage(token, {
-        chat_id: chatId,
-        text: "🔕 今天的主动提醒已暂停。\n如需恢复，请发送：恢复",
-        reply_to_message_id: message.message_id,
-        disable_web_page_preview: true,
-      });
+      if (callbackQuery) {
+        await editTelegramMessageText(
+          token,
+          chatId,
+          message.message_id,
+          applyMuteBannerToMessageText(message.text, true),
+          buildTelegramButtons(true),
+        );
+        await answerTelegramCallbackQuery(token, callbackQuery.id, "今天已暂停");
+      } else {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: "🔕 今天的主动提醒已暂停。\n如需恢复，请发送：恢复",
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: buildTelegramButtons(true),
+        });
+      }
       continue;
     } else if (text === "恢复") {
       delete state.mutedUntilDateKey;
-      await sendTelegramMessage(token, {
-        chat_id: chatId,
-        text: "🔔 今天的主动提醒已恢复。",
-        reply_to_message_id: message.message_id,
-        disable_web_page_preview: true,
-      });
+      if (callbackQuery) {
+        await editTelegramMessageText(
+          token,
+          chatId,
+          message.message_id,
+          applyMuteBannerToMessageText(message.text, false),
+          buildTelegramButtons(false),
+        );
+        await answerTelegramCallbackQuery(token, callbackQuery.id, "提醒已恢复");
+      } else {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: "🔔 今天的主动提醒已恢复。",
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: buildTelegramButtons(false),
+        });
+      }
+      continue;
+    } else if (text === "配置") {
+      if (callbackQuery) {
+        await editTelegramMessageText(
+          token,
+          chatId,
+          message.message_id,
+          buildConfigMessage(stops, state, defaultThresholdMinutes),
+          buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+        );
+      } else {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: buildConfigMessage(stops, state, defaultThresholdMinutes),
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+        });
+      }
+      if (callbackQuery) {
+        await answerTelegramCallbackQuery(token, callbackQuery.id);
+      }
       continue;
     } else if (text === "状态" || text.toLowerCase() === "status") {
       requestedServices = null;
     } else if (/^\d+$/.test(text)) {
       requestedServices = new Set([text]);
+    } else if (/^添加线路\s+\S+/.test(text)) {
+      const match = /^添加线路\s+(\S+)(?:\s+(.+))?$/.exec(text);
+      const serviceNo = match?.[1];
+      const stopIdentifier = match?.[2]?.trim();
+
+      if (stops.some((stop) => (stop.services || []).includes(serviceNo))) {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: `线路 ${serviceNo} 已在当前监控配置中。`,
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+        });
+        continue;
+      }
+
+      let targetStop = null;
+      if (stopIdentifier) {
+        targetStop = findStopByIdentifier(stops, stopIdentifier);
+      } else if (stops.length === 1) {
+        targetStop = stops[0];
+      } else {
+        const candidates = await discoverServiceCandidateStops(apiBase, stops, serviceNo);
+        if (candidates.length === 1) {
+          targetStop = candidates[0];
+        } else if (candidates.length === 0) {
+          await sendTelegramMessage(token, {
+            chat_id: chatId,
+            text: `无法自动判断线路 ${serviceNo} 属于哪个站点，请这样发送：\n添加线路 ${serviceNo} 17379\n或\n添加线路 ${serviceNo} 金文泰大牌304`,
+            reply_to_message_id: message.message_id,
+            disable_web_page_preview: true,
+            reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+          });
+          continue;
+        } else {
+          await sendTelegramMessage(token, {
+            chat_id: chatId,
+            text: `线路 ${serviceNo} 在多个已监控站点都可能存在，请指定站点。`,
+            reply_to_message_id: message.message_id,
+            disable_web_page_preview: true,
+            reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+          });
+          continue;
+        }
+      }
+
+      if (!targetStop) {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: "没有找到你指定的站点，可用站点请先发送：配置",
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+        });
+        continue;
+      }
+
+      targetStop.services = Array.from(new Set([...(targetStop.services || []), serviceNo])).sort();
+      state.monitoredStops = cloneStops(stops);
+      await sendTelegramMessage(token, {
+        chat_id: chatId,
+        text: `✅ 已添加线路 ${serviceNo}\n站点：${targetStop.stop_name} (${targetStop.stop_id})`,
+        reply_to_message_id: message.message_id,
+        disable_web_page_preview: true,
+        reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+      });
+      continue;
+    } else if (/^删除线路\s+\S+/.test(text)) {
+      const match = /^删除线路\s+(\S+)(?:\s+(.+))?$/.exec(text);
+      const serviceNo = match?.[1];
+      const stopIdentifier = match?.[2]?.trim();
+      const matchedStops = stops.filter((stop) => (stop.services || []).includes(serviceNo));
+
+      if (matchedStops.length === 0) {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: `线路 ${serviceNo} 当前不在监控配置中。`,
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+        });
+        continue;
+      }
+
+      let targetStop = null;
+      if (stopIdentifier) {
+        targetStop = findStopByIdentifier(matchedStops, stopIdentifier);
+      } else if (matchedStops.length === 1) {
+        targetStop = matchedStops[0];
+      } else {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: `线路 ${serviceNo} 在多个站点中存在，请指定站点后再删除。`,
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+        });
+        continue;
+      }
+
+      if (!targetStop) {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: "没有找到你指定的站点，可用站点请先发送：配置",
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+        });
+        continue;
+      }
+
+      targetStop.services = (targetStop.services || []).filter((item) => item !== serviceNo);
+      state.monitoredStops = cloneStops(stops);
+      await sendTelegramMessage(token, {
+        chat_id: chatId,
+        text: `✅ 已删除线路 ${serviceNo}\n站点：${targetStop.stop_name} (${targetStop.stop_id})`,
+        reply_to_message_id: message.message_id,
+        disable_web_page_preview: true,
+        reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+      });
+      continue;
+    } else if (/^阈值\s+\S+\s+\d+$/.test(text)) {
+      const match = /^阈值\s+(\S+)\s+(\d+)$/.exec(text);
+      const serviceNo = match?.[1];
+      const minutes = Number(match?.[2]);
+      state.serviceThresholdMinutes = {
+        ...(state.serviceThresholdMinutes || {}),
+        [serviceNo]: minutes,
+      };
+      await sendTelegramMessage(token, {
+        chat_id: chatId,
+        text: `✅ 已设置线路 ${serviceNo} 的提醒阈值为 ${minutes} 分钟。`,
+        reply_to_message_id: message.message_id,
+        disable_web_page_preview: true,
+        reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+      });
+      continue;
     } else {
       await sendTelegramMessage(token, {
         chat_id: chatId,
-        text: "可用命令：\n状态\n189\n963",
+        text: "可用命令：\n状态\n189\n963\n配置\n添加线路 190\n删除线路 963\n阈值 189 6",
         reply_to_message_id: message.message_id,
         disable_web_page_preview: true,
+        reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
       });
+      if (callbackQuery) {
+        await answerTelegramCallbackQuery(token, callbackQuery.id);
+      }
       continue;
     }
 
@@ -556,12 +987,26 @@ async function processTelegramCommands(token, chatId, state, apiBase, stops, tim
         ? "🔕 今天的主动提醒：已暂停"
         : "🔔 今天的主动提醒：开启中";
 
-    await sendTelegramMessage(token, {
-      chat_id: chatId,
-      text: buildStatusMessage(statuses, timeZone, weatherSummary, muteStatus),
-      reply_to_message_id: message.message_id,
-      disable_web_page_preview: true,
-    });
+    if (callbackQuery) {
+      await editTelegramMessageText(
+        token,
+        chatId,
+        message.message_id,
+        buildStatusMessage(statuses, timeZone, weatherSummary, muteStatus),
+        buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+      );
+    } else {
+      await sendTelegramMessage(token, {
+        chat_id: chatId,
+        text: buildStatusMessage(statuses, timeZone, weatherSummary, muteStatus),
+        reply_to_message_id: message.message_id,
+        disable_web_page_preview: true,
+        reply_markup: buildTelegramButtons(state.mutedUntilDateKey === todayKey),
+      });
+    }
+    if (callbackQuery) {
+      await answerTelegramCallbackQuery(token, callbackQuery.id);
+    }
   }
 }
 
@@ -581,16 +1026,21 @@ async function main() {
     timezone: timeZone,
   };
   const stateFile = path.resolve(process.cwd(), env.STATE_FILE || "./state.json");
-  const stops = JSON.parse(required(env, "STOP_CONFIG_JSON"));
+  const defaultStops = JSON.parse(required(env, "STOP_CONFIG_JSON"));
 
-  if (!Array.isArray(stops) || stops.length === 0) {
+  if (!Array.isArray(defaultStops) || defaultStops.length === 0) {
     throw new Error("STOP_CONFIG_JSON must be a non-empty JSON array");
   }
 
   if (mode === "test") {
     const token = required(env, "TELEGRAM_BOT_TOKEN");
     const chatId = required(env, "TELEGRAM_CHAT_ID");
-    await sendTelegram(token, chatId, "✅ 测试消息\nTelegram 机器人配置正常。");
+    await sendTelegramMessage(token, {
+      chat_id: chatId,
+      text: "✅ 测试消息\nTelegram 机器人配置正常。",
+      disable_web_page_preview: true,
+      reply_markup: buildTelegramButtons(false),
+    });
     console.log("Sent Telegram test message.");
     return;
   }
@@ -599,13 +1049,28 @@ async function main() {
   const token = required(env, "TELEGRAM_BOT_TOKEN");
   const chatId = required(env, "TELEGRAM_CHAT_ID");
   const state = await readState(stateFile);
+  const stops = loadEffectiveStops(state, defaultStops);
   cleanupState(state, now.toISOString());
-  await processTelegramCommands(token, chatId, state, apiBase, stops, timeZone, weatherConfig);
+  logInfo(
+    `run at ${formatLocalDateTime(now, timeZone)} ${timeZone}, window ${windowStart}-${windowEnd}, muted=${
+      state.mutedUntilDateKey === formatDateKey(now, timeZone) ? "yes" : "no"
+    }`,
+  );
+  await processTelegramCommands(
+    token,
+    chatId,
+    state,
+    apiBase,
+    stops,
+    timeZone,
+    weatherConfig,
+    maxMinutes,
+  );
   const todayKey = formatDateKey(now, timeZone);
 
   if (!isWithinWindow(now, timeZone, windowStart, windowEnd)) {
     await writeState(stateFile, state);
-    console.log("Outside configured alert window.");
+    logInfo("outside configured alert window, proactive morning notification skipped");
     return;
   }
 
@@ -621,7 +1086,8 @@ async function main() {
         continue;
       }
 
-      const selectedArrival = selectArrival(service, maxMinutes);
+      const thresholdMinutes = getServiceThresholdMinutes(state, maxMinutes, serviceNo);
+      const selectedArrival = selectArrival(service, thresholdMinutes);
       if (!selectedArrival || !selectedArrival.time) {
         continue;
       }
@@ -657,19 +1123,24 @@ async function main() {
       weatherSummary = null;
     }
 
-    await sendTelegram(
-      token,
-      chatId,
-      buildMorningAlertMessage(pendingAlerts, timeZone, weatherSummary),
-    );
+    await sendTelegramMessage(token, {
+      chat_id: chatId,
+      text: buildMorningAlertMessage(pendingAlerts, timeZone, weatherSummary),
+      disable_web_page_preview: true,
+      reply_markup: buildTelegramButtons(false),
+    });
 
     for (const alert of pendingAlerts) {
       state.alerts[alert.stateKey] = {
         lastArrivalTime: alert.selectedArrival.time,
         lastSentAt: now.toISOString(),
       };
-      console.log(`Alert sent for stop ${alert.stop.stop_id} service ${alert.serviceNo}.`);
+      logInfo(`morning alert included stop ${alert.stop.stop_id} service ${alert.serviceNo}`);
     }
+  } else if (pendingAlerts.length > 0 && state.mutedUntilDateKey === todayKey) {
+    logInfo("morning alert candidates found, but proactive notification muted for today");
+  } else {
+    logInfo("no services matched proactive morning threshold in this run");
   }
 
   await writeState(stateFile, state);

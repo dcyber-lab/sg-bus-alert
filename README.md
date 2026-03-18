@@ -93,10 +93,19 @@ During weekday morning window, if a monitored service has a next bus within the 
   - show weather summary
   - show current mute status
   - show monitored buses and next 3 arrivals
+- `配置`
+  - show current monitored stops, services, and effective thresholds
 - `189`
   - show service `189` only
 - `963`
   - show service `963` only
+- `添加线路 190`
+  - add a service into current monitored stop config
+  - if there are multiple candidate stops, specify the stop explicitly
+- `删除线路 963`
+  - remove a monitored service
+- `阈值 189 6`
+  - set per-service proactive reminder threshold to 6 minutes
 - `上车了`
   - mute proactive reminders for the rest of the current Singapore day
 - `暂停`
@@ -123,6 +132,10 @@ During weekday morning window, if a monitored service has a next bus within the 
   - last consumed Telegram update id plus one
 - `mutedUntilDateKey`
   - optional same-day mute marker in Singapore date format
+- `monitoredStops`
+  - optional runtime override of monitored stops/services
+- `serviceThresholdMinutes`
+  - optional per-service threshold overrides
 
 Example:
 
