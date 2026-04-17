@@ -41,11 +41,12 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
   - live local configuration including bot token and chat id
 - `.env.example`
   - template config
+- `state.db`
+  - primary runtime state store in SQLite
+  - stores dedupe state, Telegram update offset, mute state, monitored stops, and thresholds
 - `state.json`
-  - runtime state
-  - dedupe state for sent alerts
-  - Telegram update offset
-  - same-day mute state
+  - optional legacy migration source
+  - read once on first run if `state.db` does not exist yet
 - `~/.config/systemd/user/sg-bus-alert.service`
   - runs the script once
 - `~/.config/systemd/user/sg-bus-alert.timer`
@@ -120,14 +121,16 @@ Inline buttons keep the existing quick actions, while service buttons are genera
 
 ### Mute behavior
 
-- Mute is stored in `state.json` as `mutedUntilDateKey`
+- Mute is stored in SQLite settings as `mutedUntilDateKey`
 - Mute only affects proactive morning reminders
 - Manual queries like `状态` still work while muted
 - Mute resets automatically on the next Singapore date
 
-## Runtime state file
+## Runtime state store
 
-`state.json` currently stores:
+Primary runtime state is stored in `state.db`.
+
+Stored fields include:
 
 - `alerts`
   - dedupe state per `stop_id:service_no`
@@ -287,6 +290,7 @@ Current config keys:
 - `WEATHER_LATITUDE`
 - `WEATHER_LONGITUDE`
 - `STATE_FILE`
+  - legacy JSON migration source path; corresponding `.db` path is used as the primary runtime store
 - `STOP_CONFIG_JSON`
 
 Example monitored stop config:

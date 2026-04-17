@@ -13,6 +13,11 @@ import {
   parseServiceCallbackData,
   releaseRunLock,
 } from "./lib/runtime-helpers.mjs";
+import {
+  logAlertToHistory as logAlertToHistoryFromStore,
+  readState as readStateFromStore,
+  writeState as writeStateFromStore,
+} from "./lib/state-store.mjs";
 
 const ENV_PATH = path.join(process.cwd(), ".env");
 const execFileAsync = promisify(execFile);
@@ -245,21 +250,6 @@ function isValidStopName(value) {
   return normalized.length > 0 && normalized.length <= 80 && !/[\r\n]/.test(normalized);
 }
 
-function sqlValue(value) {
-  return `'${String(value ?? "").replace(/'/g, "''")}'`;
-}
-
-function normalizeState(state) {
-  const normalized = typeof state === "object" && state ? { ...state } : {};
-  if (!normalized.alerts || typeof normalized.alerts !== "object" || Array.isArray(normalized.alerts)) {
-    normalized.alerts = {};
-  }
-  if (!Number.isFinite(normalized.telegramUpdateOffset)) {
-    delete normalized.telegramUpdateOffset;
-  }
-  return normalized;
-}
-
 function findStopByIdentifier(stops, identifier) {
   const query = normalizeText(identifier);
   return (
@@ -333,95 +323,6 @@ function buildWeatherMessage(weather) {
     `📈 最高 ${Math.round(maxTemp)}°C / 最低 ${Math.round(minTemp)}°C`,
     `☔ 降雨概率 ${rainChance}%`,
   ].join("\n");
-}
-
-async function readState(filePath) {
-  const dbPath = filePath.replace(".json", ".db");
-  try {
-    const { stdout: settingsOut } = await execFileAsync("sqlite3", [dbPath, "SELECT key, value FROM settings;"]);
-    const state = { alerts: {} };
-    const settingsLines = settingsOut.trim().split("\n");
-    for (const line of settingsLines) {
-      if (!line) continue;
-      const index = line.indexOf("|");
-      const k = line.slice(0, index);
-      const v = line.slice(index + 1);
-      if (k === "telegramUpdateOffset") {
-        const parsedOffset = Number(v);
-        if (Number.isFinite(parsedOffset)) {
-          state.telegramUpdateOffset = parsedOffset;
-        }
-      } else if (k === "monitoredStops" || k === "serviceThresholdMinutes") state[k] = JSON.parse(v);
-      else state[k] = v;
-    }
-
-    const { stdout: alertsOut } = await execFileAsync("sqlite3", [dbPath, "SELECT key, last_arrival_time, last_sent_at FROM current_alerts;"]);
-    const alertsLines = alertsOut.trim().split("\n");
-    for (const line of alertsLines) {
-      if (!line) continue;
-      const parts = line.split("|");
-      const key = parts[0];
-      const arrival = parts[1];
-      const sent = parts[2];
-      state.alerts[key] = { lastArrivalTime: arrival, lastSentAt: sent };
-    }
-    
-    return normalizeState(state);
-  } catch (error) {
-    // Fallback to JSON
-  }
-
-  try {
-    const text = await fs.readFile(filePath, "utf8");
-    const parsed = JSON.parse(text);
-    if (typeof parsed === "object" && parsed) {
-      return normalizeState(parsed);
-    }
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      throw error;
-    }
-  }
-
-  return normalizeState({ alerts: {} });
-}
-
-async function writeState(filePath, state) {
-  const dbPath = filePath.replace(".json", ".db");
-  try {
-    const commands = [];
-    if (state.telegramUpdateOffset) {
-      commands.push(`INSERT OR REPLACE INTO settings (key, value) VALUES ('telegramUpdateOffset', ${sqlValue(state.telegramUpdateOffset)});`);
-    }
-    if (state.mutedUntilDateKey) {
-      commands.push(`INSERT OR REPLACE INTO settings (key, value) VALUES ('mutedUntilDateKey', ${sqlValue(state.mutedUntilDateKey)});`);
-    } else {
-      commands.push(`DELETE FROM settings WHERE key = 'mutedUntilDateKey';`);
-    }
-    
-    if (state.monitoredStops) commands.push(`INSERT OR REPLACE INTO settings (key, value) VALUES ('monitoredStops', ${sqlValue(JSON.stringify(state.monitoredStops))});`);
-    if (state.serviceThresholdMinutes) commands.push(`INSERT OR REPLACE INTO settings (key, value) VALUES ('serviceThresholdMinutes', ${sqlValue(JSON.stringify(state.serviceThresholdMinutes))});`);
-
-    commands.push("DELETE FROM current_alerts;");
-    for (const [key, val] of Object.entries(state.alerts || {})) {
-      commands.push(`INSERT INTO current_alerts (key, last_arrival_time, last_sent_at) VALUES (${sqlValue(key)}, ${sqlValue(val.lastArrivalTime)}, ${sqlValue(val.lastSentAt)});`);
-    }
-
-    await execFileAsync("sqlite3", [dbPath, commands.join("\n")]);
-  } catch (error) {
-    console.error("SQLite write failed:", error.message);
-  }
-  
-  await fs.writeFile(filePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-}
-
-async function logAlertToHistory(filePath, stopId, serviceNo, arrivalTime) {
-  const dbPath = filePath.replace(".json", ".db");
-  try {
-    await execFileAsync("sqlite3", [dbPath, `INSERT INTO alert_history (stop_id, service_no, arrival_time) VALUES (${sqlValue(stopId)}, ${sqlValue(serviceNo)}, ${sqlValue(arrivalTime)});`]);
-  } catch (error) {
-    console.error("Alert history log failed:", error.message);
-  }
 }
 
 async function fetchJson(url) {
@@ -1301,7 +1202,7 @@ async function main() {
       arrivals: new Map(),
       weather: null,
     };
-    const state = await readState(stateFile);
+    const state = await readStateFromStore(stateFile);
     const stops = loadEffectiveStops(state, defaultStops);
     cleanupState(state, now.toISOString());
     
@@ -1328,7 +1229,7 @@ async function main() {
     const todayKey = formatDateKey(now, timeZone);
 
     if (!activeWindow) {
-      await writeState(stateFile, state);
+      await writeStateFromStore(stateFile, state);
       logInfo("outside configured alert windows, proactive notification skipped");
       return;
     }
@@ -1394,7 +1295,7 @@ async function main() {
           lastArrivalTime: alert.selectedArrival.time,
           lastSentAt: now.toISOString(),
         };
-        await logAlertToHistory(stateFile, alert.stop.stop_id, alert.serviceNo, alert.selectedArrival.time);
+        await logAlertToHistoryFromStore(stateFile, alert.stop.stop_id, alert.serviceNo, alert.selectedArrival.time);
         logInfo(`proactive alert included stop ${alert.stop.stop_id} service ${alert.serviceNo}`);
       }
     } else if (pendingAlerts.length > 0 && state.mutedUntilDateKey === todayKey) {
@@ -1403,7 +1304,7 @@ async function main() {
       logInfo("no services matched proactive threshold in this run");
     }
 
-    await writeState(stateFile, state);
+    await writeStateFromStore(stateFile, state);
   } finally {
     await releaseRunLock(lockFile);
   }

@@ -2,6 +2,7 @@
 state.json
 *.log
 .DS_Store
+*.db
 .sg-bus-alert.lock
 *.tmp
 *.temp
@@ -10,3 +11,4 @@ state.json
 *.db-shm
 *.db.bak
 *.db.backup*
+*.migrated-to-sqlite
