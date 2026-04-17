@@ -15,6 +15,8 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
   - current ETA, load, vehicle type, and arrival clock time
 - Supports Telegram chat commands for on-demand status lookup.
 - Supports same-day mute after boarding the bus.
+- Uses a lock file so overlapping timer runs do not process state concurrently.
+- Reuses bus-arrival and weather data within a single execution cycle.
 
 ## Current live configuration
 
@@ -48,6 +50,9 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
   - runs the script once
 - `~/.config/systemd/user/sg-bus-alert.timer`
   - runs the service every 10 seconds
+- `.sg-bus-alert.lock`
+  - runtime lock file in the project directory
+  - stale lock is recovered automatically when the owning process is gone
 
 ## Telegram behavior
 
@@ -93,12 +98,10 @@ During weekday morning window, if a monitored service has a next bus within the 
   - show weather summary
   - show current mute status
   - show monitored buses and next 3 arrivals
+- `<线路号>`
+  - show that monitored service only
 - `配置`
   - show current monitored stops, services, and effective thresholds
-- `189`
-  - show service `189` only
-- `963`
-  - show service `963` only
 - `添加线路 190`
   - add a service into current monitored stop config
   - if there are multiple candidate stops, specify the stop explicitly
@@ -112,6 +115,8 @@ During weekday morning window, if a monitored service has a next bus within the 
   - same as `上车了`
 - `恢复`
   - resume proactive reminders for the current day
+
+Inline buttons keep the existing quick actions, while service buttons are generated from the current monitored services.
 
 ### Mute behavior
 
@@ -265,12 +270,13 @@ Important implementation detail:
 - this project uses polling via `getUpdates`
 - no webhook is configured
 - polling frequency is controlled by the `systemd` timer, currently every 10 seconds
+- overlapping timer runs are skipped cleanly by the lock file
 
 ## Environment variables
 
 Current config keys:
 
-- `TELEGRAM_BOT_TOKEN`
+- `BUS_ALERT_TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `TIMEZONE`
 - `ALERT_WINDOW_START`
@@ -355,6 +361,7 @@ systemctl --user restart sg-bus-alert.timer
 - Weather is best-effort and should not break bus status replies if the weather API fails.
 - This machine already has working user-level `systemd`.
 - Polling is intentionally timer-based, not webhook-based.
+- Overlapping timer invocations should be prevented with the runtime lock rather than by assuming the timer never overlaps.
 
 ## Security note
 
