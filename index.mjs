@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs/promises";
+import { unlinkSync } from "node:fs";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
@@ -10,8 +11,12 @@ import {
   buildAvailableCommandsHint,
   buildHelpMessage,
   buildTelegramButtons,
+  parseAlertWindows,
   parseServiceCallbackData,
+  pickBoardedWindow,
   releaseRunLock,
+  windowKeyFor,
+  windowPeriodLabel,
 } from "./lib/runtime-helpers.mjs";
 import {
   logAlertToHistory as logAlertToHistoryFromStore,
@@ -21,6 +26,7 @@ import {
 
 const ENV_PATH = path.join(process.cwd(), ".env");
 const execFileAsync = promisify(execFile);
+const FETCH_TIMEOUT_MS = 15 * 1000;
 
 function logInfo(message) {
   console.log(`[sg-bus-alert] ${message}`);
@@ -233,6 +239,64 @@ function getServiceThresholdMinutes(state, envDefaultMinutes, serviceNo) {
   return envDefaultMinutes;
 }
 
+function getMutedWindowKeys(state) {
+  return Array.isArray(state.mutedWindowKeys) ? state.mutedWindowKeys : [];
+}
+
+function isDayMuted(state, dateKey) {
+  return state.mutedUntilDateKey === dateKey;
+}
+
+function addMutedWindowKey(state, key) {
+  state.mutedWindowKeys = Array.from(new Set([...getMutedWindowKeys(state), key])).sort();
+}
+
+function getWindowNotices(state) {
+  if (
+    !state.windowNotices ||
+    typeof state.windowNotices !== "object" ||
+    Array.isArray(state.windowNotices)
+  ) {
+    state.windowNotices = {};
+  }
+  return state.windowNotices;
+}
+
+function findActiveWindow(now, timeZone, windows) {
+  return windows.find((window) => isWithinWindow(now, timeZone, window.start, window.end)) || null;
+}
+
+function isProactiveMutedNow(state, timeZone, windows) {
+  const now = new Date();
+  const dateKey = formatDateKey(now, timeZone);
+  if (isDayMuted(state, dateKey)) {
+    return true;
+  }
+  const activeWindow = findActiveWindow(now, timeZone, windows);
+  return Boolean(
+    activeWindow && getMutedWindowKeys(state).includes(windowKeyFor(dateKey, activeWindow)),
+  );
+}
+
+function describeMuteStatus(state, todayKey, windows) {
+  if (isDayMuted(state, todayKey)) {
+    return "🔕 主动提醒：今天已全部暂停";
+  }
+
+  const mutedStarts = getMutedWindowKeys(state)
+    .filter((key) => key.startsWith(`${todayKey}|`))
+    .map((key) => key.slice(todayKey.length + 1));
+  if (mutedStarts.length > 0) {
+    const labels = mutedStarts.map((start) => {
+      const window = windows.find((item) => item.start === start);
+      return window ? `${window.start}-${window.end}` : start;
+    });
+    return `🔕 主动提醒：今天 ${labels.join("、")} 时段已静音`;
+  }
+
+  return "🔔 主动提醒：开启中";
+}
+
 function normalizeText(value) {
   return String(value || "").trim().toLowerCase();
 }
@@ -298,7 +362,7 @@ async function fetchWeather(weatherConfig) {
   try {
     return await fetchJson(url);
   } catch (error) {
-    const { stdout } = await execFileAsync("curl", ["-fsSL", url], {
+    const { stdout } = await execFileAsync("curl", ["-fsSL", "-m", "10", url], {
       maxBuffer: 1024 * 1024,
     });
     return JSON.parse(stdout);
@@ -331,6 +395,7 @@ async function fetchJson(url) {
       "user-agent": "sg-bus-alert/1.0",
       accept: "application/json",
     },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -374,12 +439,16 @@ async function sendTelegramMessage(token, payload) {
       "content-type": "application/json",
     },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
     const body = await response.text();
     throw new Error(`Telegram send failed: ${response.status} ${response.statusText} ${body}`);
   }
+
+  const json = await response.json().catch(() => null);
+  return json?.result || null;
 }
 
 async function answerTelegramCallbackQuery(token, callbackQueryId, text = "") {
@@ -393,6 +462,7 @@ async function answerTelegramCallbackQuery(token, callbackQueryId, text = "") {
       callback_query_id: callbackQueryId,
       text,
     }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -418,6 +488,7 @@ async function editTelegramMessageReplyMarkup(token, chatId, messageId, replyMar
       message_id: messageId,
       reply_markup: replyMarkup,
     }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -445,6 +516,7 @@ async function editTelegramMessageText(token, chatId, messageId, text, replyMark
       disable_web_page_preview: true,
       reply_markup: replyMarkup,
     }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -466,6 +538,7 @@ async function fetchTelegramUpdates(token, offset) {
 
   const response = await fetch(
     `https://api.telegram.org/bot${token}/getUpdates?${params.toString()}`,
+    { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
   );
 
   if (!response.ok) {
@@ -572,8 +645,8 @@ function buildConfigMessage(stops, state, defaultThresholdMinutes) {
   return lines.join("\n");
 }
 
-function buildProactiveAlertMessage(items, timeZone, weatherSummary = null) {
-  const lines = ["⏰ 高峰时段主动提醒", ""];
+function buildWindowNoticeMessage(items, timeZone, weatherSummary, periodLabel, hasTriggered, footerLine) {
+  const lines = [`⏰ ${periodLabel}出行提醒`, ""];
 
   if (weatherSummary) {
     lines.push(weatherSummary);
@@ -592,26 +665,52 @@ function buildProactiveAlertMessage(items, timeZone, weatherSummary = null) {
   });
 
   lines.push("");
-  lines.push("⚡ 车快到了，可以准备出发了");
-  lines.push(`更新时间：${formatArrivalClock(new Date().toISOString(), timeZone)}`);
+  lines.push(hasTriggered ? "⚡ 车快到了，可以准备出发了" : "⏳ 暂时没有临近的车");
+  lines.push(footerLine);
   return lines.join("\n");
 }
 
-function applyMuteBannerToMessageText(text, isMuted) {
-  const lines = String(text || "").split("\n");
-  const filtered = lines.filter(
-    (line) => line !== "🔕 今天已暂停" && line !== "🔔 今天的主动提醒：开启中",
-  );
+const NOTICE_FOOTER_PREFIXES = ["🔄 自动刷新中", "⏹ ", "🛑 已上车", "🔕 今天提醒已暂停"];
 
-  if (
-    filtered.length >= 2 &&
-    (filtered[0] === "🚏 当前公交状态" ||
-      filtered[0] === "🚏 手动查询状态" ||
-      filtered[0] === "⏰ 晨间通知" ||
-      filtered[0] === "⏰ 高峰时段主动提醒") &&
-    filtered[1] === ""
-  ) {
-    filtered.splice(2, 0, isMuted ? "🔕 今天已暂停" : "🔔 今天的主动提醒：开启中", "");
+function swapNoticeFooter(text, footerLine) {
+  return String(text || "")
+    .split("\n")
+    .map((line) =>
+      NOTICE_FOOTER_PREFIXES.some((prefix) => line.startsWith(prefix)) ? footerLine : line,
+    )
+    .join("\n");
+}
+
+const MUTE_BANNER_LINES = new Set([
+  "🔕 今天已暂停",
+  "🔔 今天的主动提醒：开启中",
+  "🛑 本时段已上车",
+]);
+
+const MUTE_BANNER_HEADERS = new Set([
+  "🚏 当前公交状态",
+  "🚏 手动查询状态",
+  "⏰ 晨间通知",
+  "⏰ 高峰时段主动提醒",
+  "⏰ 晨间出行提醒",
+  "⏰ 晚间出行提醒",
+]);
+
+function applyMuteBannerToMessageText(text, bannerLine) {
+  const lines = String(text || "").split("\n");
+  const filtered = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (MUTE_BANNER_LINES.has(lines[index])) {
+      if (lines[index + 1] === "") {
+        index += 1;
+      }
+      continue;
+    }
+    filtered.push(lines[index]);
+  }
+
+  if (bannerLine && filtered.length >= 2 && MUTE_BANNER_HEADERS.has(filtered[0]) && filtered[1] === "") {
+    filtered.splice(2, 0, bannerLine, "");
   }
 
   return filtered.join("\n");
@@ -631,21 +730,30 @@ function selectArrival(service, maxMinutes) {
   return eligible[0] || null;
 }
 
-function cleanupState(state, nowIso) {
-  const cutoff = new Date(nowIso).getTime() - 12 * 60 * 60 * 1000;
-  for (const [key, value] of Object.entries(state.alerts || {})) {
-    if (!value.lastSentAt) {
-      delete state.alerts[key];
-      continue;
-    }
+function cleanupState(state, nowIso, timeZone) {
+  const now = new Date(nowIso);
+  const todayKey = formatDateKey(now, timeZone);
 
-    if (new Date(value.lastSentAt).getTime() < cutoff) {
-      delete state.alerts[key];
-    }
+  state.alerts = {};
+
+  if (state.mutedUntilDateKey && state.mutedUntilDateKey < todayKey) {
+    delete state.mutedUntilDateKey;
   }
 
-  if (state.mutedUntilDateKey && state.mutedUntilDateKey < formatDateKey(new Date(nowIso), "Asia/Singapore")) {
-    delete state.mutedUntilDateKey;
+  const mutedToday = getMutedWindowKeys(state).filter((key) => key.startsWith(`${todayKey}|`));
+  if (mutedToday.length > 0) {
+    state.mutedWindowKeys = mutedToday;
+  } else {
+    delete state.mutedWindowKeys;
+  }
+
+  const keepFromKey = formatDateKey(new Date(now.getTime() - 2 * 24 * 60 * 60 * 1000), timeZone);
+  const notices = getWindowNotices(state);
+  for (const key of Object.keys(notices)) {
+    const dateKey = key.split("|")[0];
+    if (dateKey < keepFromKey || (dateKey < todayKey && notices[key]?.finalized)) {
+      delete notices[key];
+    }
   }
 }
 
@@ -693,6 +801,52 @@ async function discoverServiceCandidateStops(apiBase, stops, serviceNo, runCache
   return candidates;
 }
 
+async function evaluateWindowServices(apiBase, stops, state, defaultThresholdMinutes, runCache) {
+  const items = [];
+  const triggered = [];
+
+  for (const row of flattenStopServices(stops)) {
+    const arrivalData = await fetchArrivalsCached(apiBase, row.stop.stop_id, runCache);
+    const service = (arrivalData.services || []).find((item) => item.no === row.serviceNo);
+    const arrivals = service
+      ? [service.next, service.subsequent, service.next3].filter((arrival) => arrival || arrival === null)
+      : [];
+    items.push({ stop: row.stop, serviceNo: row.serviceNo, arrivals });
+
+    if (!service) {
+      continue;
+    }
+
+    const thresholdMinutes = getServiceThresholdMinutes(state, defaultThresholdMinutes, row.serviceNo);
+    const selectedArrival = selectArrival(service, thresholdMinutes);
+    if (selectedArrival?.time) {
+      triggered.push({
+        key: `${row.stop.stop_id}:${row.serviceNo}`,
+        stopId: row.stop.stop_id,
+        serviceNo: row.serviceNo,
+        arrivalTime: selectedArrival.time,
+      });
+    }
+  }
+
+  return { items, triggered };
+}
+
+async function finalizeWindowNotice(token, chatId, notice, footerLine, replyMarkup) {
+  notice.finalized = true;
+  if (!notice.messageId || !notice.lastText) {
+    return;
+  }
+
+  const text = swapNoticeFooter(notice.lastText, footerLine);
+  try {
+    await editTelegramMessageText(token, chatId, notice.messageId, text, replyMarkup);
+    notice.lastText = text;
+  } catch (error) {
+    logInfo(`window notice finalize edit failed: ${error.message}`);
+  }
+}
+
 async function processTelegramCommands(
   token,
   chatId,
@@ -703,6 +857,7 @@ async function processTelegramCommands(
   weatherConfig,
   defaultThresholdMinutes,
   runCache,
+  alertWindows,
 ) {
   const offset =
     typeof state.telegramUpdateOffset === "number" ? state.telegramUpdateOffset : undefined;
@@ -743,21 +898,86 @@ async function processTelegramCommands(
     let requestedServices = null;
     const todayKey = formatDateKey(new Date(), timeZone);
 
-    if (text === "上车了" || text === "暂停") {
-      state.mutedUntilDateKey = todayKey;
-      if (callbackQuery) {
-        await editTelegramMessageText(
+    if (text === "上车了") {
+      const { hour, minute } = getLocalParts(new Date(), timeZone);
+      const targetWindow = pickBoardedWindow(hour * 60 + minute, alertWindows);
+      const targetKey = targetWindow ? windowKeyFor(todayKey, targetWindow) : null;
+      if (targetKey) {
+        addMutedWindowKey(state, targetKey);
+      }
+
+      const notices = getWindowNotices(state);
+      const targetNotice = targetKey ? notices[targetKey] : null;
+      if (targetNotice && !targetNotice.finalized) {
+        await finalizeWindowNotice(
           token,
           chatId,
-          message.message_id,
-          applyMuteBannerToMessageText(message.text, true),
+          targetNotice,
+          "🛑 已上车，本时段提醒结束",
           buildTelegramButtons(stops, true),
         );
+      }
+
+      if (callbackQuery) {
+        if (!targetNotice || targetNotice.messageId !== message.message_id) {
+          await editTelegramMessageText(
+            token,
+            chatId,
+            message.message_id,
+            applyMuteBannerToMessageText(message.text, "🛑 本时段已上车"),
+            buildTelegramButtons(stops, true),
+          );
+        }
+        await answerTelegramCallbackQuery(token, callbackQuery.id, "已记录上车");
+      } else {
+        const scopeText = targetWindow
+          ? `今天 ${targetWindow.start}-${targetWindow.end} 时段不再提醒，其他时段照常。`
+          : "本时段不再提醒。";
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: `🛑 已记录上车。${scopeText}\n如需恢复，请发送：恢复`,
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: buildTelegramButtons(stops, true),
+        });
+      }
+      continue;
+    } else if (text === "暂停") {
+      state.mutedUntilDateKey = todayKey;
+
+      const notices = getWindowNotices(state);
+      let editedCurrentMessage = false;
+      for (const [key, notice] of Object.entries(notices)) {
+        if (!key.startsWith(`${todayKey}|`) || !notice || notice.finalized) {
+          continue;
+        }
+        await finalizeWindowNotice(
+          token,
+          chatId,
+          notice,
+          "🔕 今天提醒已暂停",
+          buildTelegramButtons(stops, true),
+        );
+        if (notice.messageId === message.message_id) {
+          editedCurrentMessage = true;
+        }
+      }
+
+      if (callbackQuery) {
+        if (!editedCurrentMessage) {
+          await editTelegramMessageText(
+            token,
+            chatId,
+            message.message_id,
+            applyMuteBannerToMessageText(message.text, "🔕 今天已暂停"),
+            buildTelegramButtons(stops, true),
+          );
+        }
         await answerTelegramCallbackQuery(token, callbackQuery.id, "今天已暂停");
       } else {
         await sendTelegramMessage(token, {
           chat_id: chatId,
-          text: "🔕 今天的主动提醒已暂停。\n如需恢复，请发送：恢复",
+          text: "🔕 今天的主动提醒已全部暂停。\n如需恢复，请发送：恢复",
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
           reply_markup: buildTelegramButtons(stops, true),
@@ -766,12 +986,34 @@ async function processTelegramCommands(
       continue;
     } else if (text === "恢复") {
       delete state.mutedUntilDateKey;
+      const remainingMutedKeys = getMutedWindowKeys(state).filter(
+        (key) => !key.startsWith(`${todayKey}|`),
+      );
+      if (remainingMutedKeys.length > 0) {
+        state.mutedWindowKeys = remainingMutedKeys;
+      } else {
+        delete state.mutedWindowKeys;
+      }
+
+      const notices = getWindowNotices(state);
+      const nowForResume = new Date();
+      for (const [key, notice] of Object.entries(notices)) {
+        if (!key.startsWith(`${todayKey}|`) || !notice?.finalized || !notice.messageId) {
+          continue;
+        }
+        const start = key.slice(todayKey.length + 1);
+        const window = alertWindows.find((item) => item.start === start);
+        if (window && isWithinWindow(nowForResume, timeZone, window.start, window.end)) {
+          notice.finalized = false;
+        }
+      }
+
       if (callbackQuery) {
         await editTelegramMessageText(
           token,
           chatId,
           message.message_id,
-          applyMuteBannerToMessageText(message.text, false),
+          applyMuteBannerToMessageText(message.text, "🔔 今天的主动提醒：开启中"),
           buildTelegramButtons(stops, false),
         );
         await answerTelegramCallbackQuery(token, callbackQuery.id, "提醒已恢复");
@@ -792,7 +1034,7 @@ async function processTelegramCommands(
           chatId,
           message.message_id,
           buildConfigMessage(stops, state, defaultThresholdMinutes),
-          buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         );
       } else {
         await sendTelegramMessage(token, {
@@ -800,7 +1042,7 @@ async function processTelegramCommands(
           text: buildConfigMessage(stops, state, defaultThresholdMinutes),
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
       }
       if (callbackQuery) {
@@ -822,7 +1064,7 @@ async function processTelegramCommands(
           text: "站点格式无效。请使用 5 位站点 ID，并避免名称里出现换行。",
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -833,7 +1075,7 @@ async function processTelegramCommands(
           text: `站点 ${stopId} 已在监控配置中。`,
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -846,7 +1088,7 @@ async function processTelegramCommands(
         text: `✅ 已添加站点：${stopName} (${stopId})\n现在可以添加线路到该站点。`,
         reply_to_message_id: message.message_id,
         disable_web_page_preview: true,
-        reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+        reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
       });
       continue;
     } else if (/^删除站点\s+\S+/.test(text)) {
@@ -859,7 +1101,7 @@ async function processTelegramCommands(
           text: "站点 ID 格式无效，请使用 5 位数字站点 ID。",
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -872,7 +1114,7 @@ async function processTelegramCommands(
           text: `未找到站点 ID 为 ${stopId} 的配置。`,
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -884,7 +1126,7 @@ async function processTelegramCommands(
         text: `✅ 已删除站点：${removedStop.stop_name} (${removedStop.stop_id})`,
         reply_to_message_id: message.message_id,
         disable_web_page_preview: true,
-        reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+        reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
       });
       continue;
     } else if (/^添加线路\s+\S+/.test(text)) {
@@ -898,7 +1140,7 @@ async function processTelegramCommands(
           text: "线路号格式无效，请使用字母和数字组成的线路号。",
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -909,7 +1151,7 @@ async function processTelegramCommands(
           text: `线路 ${serviceNo} 已在当前监控配置中。如果要添加到其他站点，请指定站点。`,
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -929,7 +1171,7 @@ async function processTelegramCommands(
             text: `无法自动判断线路 ${serviceNo} 属于哪个站点，请这样发送：\n添加线路 ${serviceNo} 17379`,
             reply_to_message_id: message.message_id,
             disable_web_page_preview: true,
-            reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+            reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
           });
           continue;
         } else {
@@ -938,7 +1180,7 @@ async function processTelegramCommands(
             text: `线路 ${serviceNo} 在多个已监控站点都可能存在，请指定站点。`,
             reply_to_message_id: message.message_id,
             disable_web_page_preview: true,
-            reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+            reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
           });
           continue;
         }
@@ -950,7 +1192,7 @@ async function processTelegramCommands(
           text: "没有找到你指定的站点，可用站点请先发送：配置",
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -962,7 +1204,7 @@ async function processTelegramCommands(
         text: `✅ 已添加线路 ${serviceNo}\n站点：${targetStop.stop_name} (${targetStop.stop_id})`,
         reply_to_message_id: message.message_id,
         disable_web_page_preview: true,
-        reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+        reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
       });
       continue;
     } else if (/^删除线路\s+\S+/.test(text)) {
@@ -976,7 +1218,7 @@ async function processTelegramCommands(
           text: "线路号格式无效，请使用字母和数字组成的线路号。",
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -989,7 +1231,7 @@ async function processTelegramCommands(
           text: `线路 ${serviceNo} 当前不在监控配置中。`,
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -1005,7 +1247,7 @@ async function processTelegramCommands(
           text: `线路 ${serviceNo} 在多个站点中存在，请指定站点后再删除。`,
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -1016,7 +1258,7 @@ async function processTelegramCommands(
           text: "没有找到你指定的站点，可用站点请先发送：配置",
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -1028,7 +1270,7 @@ async function processTelegramCommands(
         text: `✅ 已删除线路 ${serviceNo}\n站点：${targetStop.stop_name} (${targetStop.stop_id})`,
         reply_to_message_id: message.message_id,
         disable_web_page_preview: true,
-        reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+        reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
       });
       continue;
     } else if (/^阈值\s+\S+\s+\d+$/.test(text)) {
@@ -1042,7 +1284,7 @@ async function processTelegramCommands(
           text: "线路号格式无效，请使用字母和数字组成的线路号。",
           reply_to_message_id: message.message_id,
           disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
         });
         continue;
       }
@@ -1056,7 +1298,7 @@ async function processTelegramCommands(
         text: `✅ 已设置线路 ${serviceNo} 的提醒阈值为 ${minutes} 分钟。`,
         reply_to_message_id: message.message_id,
         disable_web_page_preview: true,
-        reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+        reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
       });
       continue;
     } else {
@@ -1065,7 +1307,7 @@ async function processTelegramCommands(
         text: buildHelpMessage(stops),
         reply_to_message_id: message.message_id,
         disable_web_page_preview: true,
-        reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+        reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
       });
       if (callbackQuery) {
         await answerTelegramCallbackQuery(token, callbackQuery.id);
@@ -1092,10 +1334,7 @@ async function processTelegramCommands(
       weatherSummary = null;
     }
 
-    const muteStatus =
-      state.mutedUntilDateKey === todayKey
-        ? "🔕 今天的主动提醒：已暂停"
-        : "🔔 今天的主动提醒：开启中";
+    const muteStatus = describeMuteStatus(state, todayKey, alertWindows);
 
     if (callbackQuery) {
       await editTelegramMessageText(
@@ -1103,7 +1342,7 @@ async function processTelegramCommands(
         chatId,
         message.message_id,
         buildStatusMessage(statuses, timeZone, stops, weatherSummary, muteStatus),
-        buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+        buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
       );
     } else {
       await sendTelegramMessage(token, {
@@ -1111,7 +1350,7 @@ async function processTelegramCommands(
         text: buildStatusMessage(statuses, timeZone, stops, weatherSummary, muteStatus),
         reply_to_message_id: message.message_id,
         disable_web_page_preview: true,
-        reply_markup: buildTelegramButtons(stops, state.mutedUntilDateKey === todayKey),
+        reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
       });
     }
     if (callbackQuery) {
@@ -1125,37 +1364,10 @@ async function main() {
   const mode = process.argv[2] || "run";
 
   const timeZone = env.TIMEZONE || "Asia/Singapore";
-  
-  // Parse alert windows
-  const alertWindows = [];
-  if (env.ALERT_WINDOWS) {
-    env.ALERT_WINDOWS.split(",").forEach(w => {
-      const [start, end] = w.trim().split("-");
-      if (start && end) alertWindows.push({ start, end });
-    });
-  }
-  
-  // Morning window (legacy/first-class)
-  if (env.ALERT_WINDOW_START && env.ALERT_WINDOW_END) {
-    if (!alertWindows.some(w => w.start === env.ALERT_WINDOW_START)) {
-      alertWindows.push({ start: env.ALERT_WINDOW_START, end: env.ALERT_WINDOW_END });
-    }
-  }
-  
-  // Evening window (first-class)
-  if (env.EVENING_WINDOW_START && env.EVENING_WINDOW_END) {
-    if (!alertWindows.some(w => w.start === env.EVENING_WINDOW_START)) {
-      alertWindows.push({ start: env.EVENING_WINDOW_START, end: env.EVENING_WINDOW_END });
-    }
-  }
+  const alertWindows = parseAlertWindows(env);
 
-  // Default if none configured
-  if (alertWindows.length === 0) {
-    alertWindows.push({ start: "08:30", end: "09:30" });
-  }
-
-  const maxMinutes = Number(env.ALERT_THRESHOLD_MINUTES || "8");
-  const cooldownMinutes = Number(env.COOLDOWN_MINUTES || "3");
+  const parsedThreshold = Number(env.ALERT_THRESHOLD_MINUTES);
+  const maxMinutes = Number.isFinite(parsedThreshold) && parsedThreshold > 0 ? parsedThreshold : 8;
   const apiBase = env.ARRIVAL_API_BASE || "https://arrivelah2.busrouter.sg";
   const weatherConfig = {
     latitude: env.WEATHER_LATITUDE || "1.3179",
@@ -1197,114 +1409,213 @@ async function main() {
     logInfo(`recovered stale lock ${lockFile}`);
   }
 
+  const releaseLockOnSignal = () => {
+    try {
+      unlinkSync(lockFile);
+    } catch {
+      // lock already gone
+    }
+    process.exit(1);
+  };
+  process.once("SIGTERM", releaseLockOnSignal);
+  process.once("SIGINT", releaseLockOnSignal);
+
   try {
     const runCache = {
       arrivals: new Map(),
       weather: null,
     };
     const state = await readStateFromStore(stateFile);
-    const stops = loadEffectiveStops(state, defaultStops);
-    cleanupState(state, now.toISOString());
-    
-    const activeWindow = alertWindows.find(w => isWithinWindow(now, timeZone, w.start, w.end));
 
-    logInfo(
-      `run at ${formatLocalDateTime(now, timeZone)} ${timeZone}, active_window=${activeWindow ? activeWindow.start + '-' + activeWindow.end : 'none'}, muted=${
-        state.mutedUntilDateKey === formatDateKey(now, timeZone) ? "yes" : "no"
-      }`,
-    );
-    
-    await processTelegramCommands(
-      token,
-      chatId,
-      state,
-      apiBase,
-      stops,
-      timeZone,
-      weatherConfig,
-      maxMinutes,
-      runCache,
-    );
-    
-    const todayKey = formatDateKey(now, timeZone);
+    try {
+      const stops = loadEffectiveStops(state, defaultStops);
+      cleanupState(state, now.toISOString(), timeZone);
 
-    if (!activeWindow) {
-      await writeStateFromStore(stateFile, state);
-      logInfo("outside configured alert windows, proactive notification skipped");
-      return;
-    }
+      const activeWindow = findActiveWindow(now, timeZone, alertWindows);
+      const todayKey = formatDateKey(now, timeZone);
 
-    const pendingAlerts = [];
+      logInfo(
+        `run at ${formatLocalDateTime(now, timeZone)} ${timeZone}, active_window=${
+          activeWindow ? `${activeWindow.start}-${activeWindow.end}` : "none"
+        }, muted=${isProactiveMutedNow(state, timeZone, alertWindows) ? "yes" : "no"}`,
+      );
 
-    for (const stop of stops) {
-      const arrivalData = await fetchArrivalsCached(apiBase, stop.stop_id, runCache);
-      const services = arrivalData.services || [];
+      await processTelegramCommands(
+        token,
+        chatId,
+        state,
+        apiBase,
+        stops,
+        timeZone,
+        weatherConfig,
+        maxMinutes,
+        runCache,
+        alertWindows,
+      );
 
-      for (const serviceNo of stop.services || []) {
-        const service = services.find((item) => item.no === serviceNo);
-        if (!service) {
+      const notices = getWindowNotices(state);
+      const nowClock = formatArrivalClock(now.toISOString(), timeZone);
+
+      for (const [key, notice] of Object.entries(notices)) {
+        if (!notice || notice.finalized) {
           continue;
         }
-
-        const thresholdMinutes = getServiceThresholdMinutes(state, maxMinutes, serviceNo);
-        const selectedArrival = selectArrival(service, thresholdMinutes);
-        if (!selectedArrival || !selectedArrival.time) {
+        const [noticeDateKey, windowStart] = key.split("|");
+        const window = alertWindows.find((item) => item.start === windowStart);
+        const stillActive =
+          noticeDateKey === todayKey &&
+          window &&
+          isWithinWindow(now, timeZone, window.start, window.end);
+        if (stillActive) {
           continue;
         }
+        await finalizeWindowNotice(
+          token,
+          chatId,
+          notice,
+          `⏹ 本时段提醒已结束｜最后更新：${nowClock}`,
+          buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
+        );
+        logInfo(`window notice finalized for ${key}`);
+      }
 
-        const key = `${stop.stop_id}:${serviceNo}`;
-        const record = state.alerts[key] || {};
-        const cooldownMs = cooldownMinutes * 60 * 1000;
-        const sentRecently =
-          record.lastSentAt &&
-          now.getTime() - new Date(record.lastSentAt).getTime() < cooldownMs;
-        const sameArrival = record.lastArrivalTime === selectedArrival.time;
+      if (!activeWindow) {
+        logInfo("outside configured alert windows, proactive notification skipped");
+        return;
+      }
 
-        if (sameArrival || sentRecently) {
-          continue;
+      const windowKey = windowKeyFor(todayKey, activeWindow);
+      const windowMuted =
+        isDayMuted(state, todayKey) || getMutedWindowKeys(state).includes(windowKey);
+
+      if (windowMuted) {
+        const notice = notices[windowKey];
+        if (notice && !notice.finalized) {
+          await finalizeWindowNotice(
+            token,
+            chatId,
+            notice,
+            isDayMuted(state, todayKey) ? "🔕 今天提醒已暂停" : "🛑 已上车，本时段提醒结束",
+            buildTelegramButtons(stops, true),
+          );
+        }
+        logInfo("active window is muted for today, proactive notification skipped");
+        return;
+      }
+
+      const { items, triggered } = await evaluateWindowServices(
+        apiBase,
+        stops,
+        state,
+        maxMinutes,
+        runCache,
+      );
+      const periodLabel = windowPeriodLabel(activeWindow);
+      const existingNotice = notices[windowKey];
+
+      if (!existingNotice) {
+        if (triggered.length === 0 || items.length === 0) {
+          logInfo("no services matched proactive threshold in this run");
+          return;
         }
 
-        pendingAlerts.push({
-          stop,
-          serviceNo,
-          arrivals: [service.next, service.subsequent, service.next3],
-          selectedArrival,
-          stateKey: key,
+        let weatherSummary = null;
+        try {
+          const weather = await fetchWeatherCached(weatherConfig, runCache);
+          weatherSummary = buildWeatherMessage(weather);
+        } catch (error) {
+          weatherSummary = null;
+        }
+
+        const text = buildWindowNoticeMessage(
+          items,
+          timeZone,
+          weatherSummary,
+          periodLabel,
+          true,
+          `🔄 自动刷新中｜更新时间：${nowClock}`,
+        );
+        const sent = await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text,
+          disable_web_page_preview: true,
+          reply_markup: buildTelegramButtons(stops, false),
         });
-      }
-    }
 
-    if (pendingAlerts.length > 0 && state.mutedUntilDateKey !== todayKey) {
-      let weatherSummary = null;
-      try {
-        const weather = await fetchWeatherCached(weatherConfig, runCache);
-        weatherSummary = buildWeatherMessage(weather);
-      } catch (error) {
-        weatherSummary = null;
-      }
-
-      await sendTelegramMessage(token, {
-        chat_id: chatId,
-        text: buildProactiveAlertMessage(pendingAlerts, timeZone, weatherSummary),
-        disable_web_page_preview: true,
-        reply_markup: buildTelegramButtons(stops, false),
-      });
-
-      for (const alert of pendingAlerts) {
-        state.alerts[alert.stateKey] = {
-          lastArrivalTime: alert.selectedArrival.time,
-          lastSentAt: now.toISOString(),
+        const notice = {
+          messageId: sent?.message_id || null,
+          lastText: text,
+          weatherSummary,
+          loggedServices: [],
+          finalized: !sent?.message_id,
         };
-        await logAlertToHistoryFromStore(stateFile, alert.stop.stop_id, alert.serviceNo, alert.selectedArrival.time);
-        logInfo(`proactive alert included stop ${alert.stop.stop_id} service ${alert.serviceNo}`);
-      }
-    } else if (pendingAlerts.length > 0 && state.mutedUntilDateKey === todayKey) {
-      logInfo("proactive alert candidates found, but notification muted for today");
-    } else {
-      logInfo("no services matched proactive threshold in this run");
-    }
+        notices[windowKey] = notice;
 
-    await writeStateFromStore(stateFile, state);
+        for (const item of triggered) {
+          notice.loggedServices.push(item.key);
+          await logAlertToHistoryFromStore(stateFile, item.stopId, item.serviceNo, item.arrivalTime);
+        }
+        logInfo(
+          `window notice sent for ${windowKey}${notice.messageId ? ` message_id=${notice.messageId}` : ""}`,
+        );
+      } else if (!existingNotice.finalized) {
+        if (existingNotice.weatherSummary == null) {
+          try {
+            const weather = await fetchWeatherCached(weatherConfig, runCache);
+            existingNotice.weatherSummary = buildWeatherMessage(weather);
+          } catch (error) {
+            existingNotice.weatherSummary = null;
+          }
+        }
+
+        const text = buildWindowNoticeMessage(
+          items,
+          timeZone,
+          existingNotice.weatherSummary,
+          periodLabel,
+          triggered.length > 0,
+          `🔄 自动刷新中｜更新时间：${nowClock}`,
+        );
+
+        if (text !== existingNotice.lastText && existingNotice.messageId) {
+          try {
+            await editTelegramMessageText(
+              token,
+              chatId,
+              existingNotice.messageId,
+              text,
+              buildTelegramButtons(stops, false),
+            );
+            existingNotice.lastText = text;
+            logInfo(`window notice refreshed for ${windowKey}`);
+          } catch (error) {
+            if (error.message.includes("message to edit not found")) {
+              existingNotice.finalized = true;
+              logInfo("window notice message was deleted, stopping refresh for this window");
+            } else {
+              throw error;
+            }
+          }
+        }
+
+        if (!Array.isArray(existingNotice.loggedServices)) {
+          existingNotice.loggedServices = [];
+        }
+        for (const item of triggered) {
+          if (existingNotice.loggedServices.includes(item.key)) {
+            continue;
+          }
+          existingNotice.loggedServices.push(item.key);
+          await logAlertToHistoryFromStore(stateFile, item.stopId, item.serviceNo, item.arrivalTime);
+        }
+      }
+    } finally {
+      try {
+        await writeStateFromStore(stateFile, state);
+      } catch (writeError) {
+        console.error(`State write failed: ${writeError.message}`);
+      }
+    }
   } finally {
     await releaseRunLock(lockFile);
   }

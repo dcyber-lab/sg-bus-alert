@@ -11,7 +11,11 @@ import {
   buildLockContents,
   buildTelegramButtons,
   getMonitoredServices,
+  parseAlertWindows,
+  pickBoardedWindow,
   releaseRunLock,
+  windowKeyFor,
+  windowPeriodLabel,
 } from "../lib/runtime-helpers.mjs";
 
 test("buildTelegramButtons reflects current monitored services with a practical cap", () => {
@@ -95,4 +99,54 @@ test("buildLockContents records a command hint for safer stale lock checks", () 
   assert.equal(payload.pid, process.pid);
   assert.equal(typeof payload.commandHint, "string");
   assert.ok(payload.commandHint.length > 0);
+});
+
+test("parseAlertWindows merges ALERT_WINDOWS with legacy window keys and dedupes", () => {
+  assert.deepEqual(
+    parseAlertWindows({
+      ALERT_WINDOWS: "08:30-09:30,17:30-18:30",
+      ALERT_WINDOW_START: "08:30",
+      ALERT_WINDOW_END: "09:30",
+      EVENING_WINDOW_START: "17:30",
+      EVENING_WINDOW_END: "18:30",
+    }),
+    [
+      { start: "08:30", end: "09:30" },
+      { start: "17:30", end: "18:30" },
+    ],
+  );
+
+  assert.deepEqual(parseAlertWindows({}), [{ start: "08:30", end: "09:30" }]);
+
+  assert.deepEqual(
+    parseAlertWindows({
+      EVENING_WINDOW_START: "17:30",
+      EVENING_WINDOW_END: "18:30",
+      ALERT_WINDOW_START: "08:30",
+      ALERT_WINDOW_END: "09:30",
+    }),
+    [
+      { start: "08:30", end: "09:30" },
+      { start: "17:30", end: "18:30" },
+    ],
+  );
+});
+
+test("pickBoardedWindow prefers the active window, then the next upcoming one", () => {
+  const windows = [
+    { start: "08:30", end: "09:30" },
+    { start: "17:30", end: "18:30" },
+  ];
+
+  assert.deepEqual(pickBoardedWindow(9 * 60, windows), { start: "08:30", end: "09:30" });
+  assert.deepEqual(pickBoardedWindow(12 * 60, windows), { start: "17:30", end: "18:30" });
+  assert.deepEqual(pickBoardedWindow(7 * 60, windows), { start: "08:30", end: "09:30" });
+  assert.deepEqual(pickBoardedWindow(20 * 60, windows), { start: "17:30", end: "18:30" });
+  assert.equal(pickBoardedWindow(9 * 60, []), null);
+});
+
+test("windowKeyFor and windowPeriodLabel derive stable identifiers", () => {
+  assert.equal(windowKeyFor("2026-07-29", { start: "08:30", end: "09:30" }), "2026-07-29|08:30");
+  assert.equal(windowPeriodLabel({ start: "08:30", end: "09:30" }), "晨间");
+  assert.equal(windowPeriodLabel({ start: "17:30", end: "18:30" }), "晚间");
 });

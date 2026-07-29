@@ -7,15 +7,16 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
 ## What it does
 
 - Monitors selected Singapore bus stops and bus services.
-- Sends proactive Telegram morning notifications on weekdays from `08:30` to `09:30` in `Asia/Singapore`.
-- Morning notification is merged into a single message when multiple monitored services hit the threshold in the same run.
-- Morning notification includes:
+- Sends proactive Telegram notifications on weekdays during configured windows (currently `08:30-09:30` and `17:30-18:30` in `Asia/Singapore`).
+- Each window sends exactly one notification message; afterwards the bot edits that same message in place on every polling cycle, so ETAs stay fresh without repeated pushes.
+- The window notification includes:
   - weather summary
-  - the next 3 buses for each triggered service
+  - the next 3 buses for every monitored service
   - current ETA, load, vehicle type, and arrival clock time
 - Supports Telegram chat commands for on-demand status lookup.
-- Supports same-day mute after boarding the bus.
+- Supports boarding mute (`上车了`, current window only) and whole-day mute (`暂停`).
 - Uses a lock file so overlapping timer runs do not process state concurrently.
+- All outbound HTTP calls carry a 15s timeout; a hung run is killed by systemd after 90s (`TimeoutStartSec`).
 - Reuses bus-arrival and weather data within a single execution cycle.
 
 ## Current live configuration
@@ -23,9 +24,8 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
 - Bus stop `17379` -> `金文泰大牌304` -> service `189`
 - Bus stop `17051` -> `丽晶园对面` -> service `963`
 - Timezone: `Asia/Singapore`
-- Alert window: `08:30-09:30`
+- Alert windows: `08:30-09:30` and `17:30-18:30`
 - Threshold: `8` minutes
-- Cooldown: `3` minutes
 - Telegram bot: `@sg_bus_alert_bot`
 
 ## Main files
@@ -43,12 +43,9 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
   - template config
 - `state.db`
   - primary runtime state store in SQLite
-  - stores dedupe state, Telegram update offset, mute state, monitored stops, and thresholds
-- `state.json`
-  - optional legacy migration source
-  - read once on first run if `state.db` does not exist yet
+  - stores Telegram update offset, mute state (whole-day and per-window), window notice tracking, monitored stops, and thresholds
 - `~/.config/systemd/user/sg-bus-alert.service`
-  - runs the script once
+  - runs the script once, killed after 90s if it hangs
 - `~/.config/systemd/user/sg-bus-alert.timer`
   - runs the service every 10 seconds
 - `.sg-bus-alert.lock`
@@ -57,12 +54,12 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
 
 ## Telegram behavior
 
-### Proactive morning notification
+### Proactive window notification
 
-During weekday morning window, if a monitored service has a next bus within the configured threshold, the bot sends one merged message like:
+During a weekday alert window, when any monitored service has a bus within its threshold, the bot sends one message like:
 
 ```text
-⏰ 晨间通知
+⏰ 晨间出行提醒
 
 🌦️ 今天天气：阵雨
 🌡️ 现在 27°C
@@ -89,9 +86,11 @@ During weekday morning window, if a monitored service has a next bus within the 
    🚍 单层
    🕒 09:03:18
 
-⚡ 可以准备出门了
-更新时间：08:37:00
+⚡ 车快到了，可以准备出发了
+🔄 自动刷新中｜更新时间：08:37:00
 ```
+
+After the first send, no further messages are pushed for that window. The bot silently edits the same message every polling cycle so the ETAs stay current. When the window ends, the footer flips to `⏹ 本时段提醒已结束`. Evening windows use the `⏰ 晚间出行提醒` header. `alert_history` records one row per service per window.
 
 ### Telegram commands
 
@@ -111,20 +110,21 @@ During weekday morning window, if a monitored service has a next bus within the 
 - `阈值 189 6`
   - set per-service proactive reminder threshold to 6 minutes
 - `上车了`
-  - mute proactive reminders for the rest of the current Singapore day
+  - mute the current (or next upcoming) alert window for today; other windows still fire
 - `暂停`
-  - same as `上车了`
+  - mute all proactive reminders for the rest of the current Singapore day
 - `恢复`
-  - resume proactive reminders for the current day
+  - clear today's mutes (both kinds); a still-active window notice resumes refreshing
 
 Inline buttons keep the existing quick actions, while service buttons are generated from the current monitored services.
 
 ### Mute behavior
 
-- Mute is stored in SQLite settings as `mutedUntilDateKey`
-- Mute only affects proactive morning reminders
+- `暂停` stores `mutedUntilDateKey` (whole-day mute)
+- `上车了` stores a `mutedWindowKeys` entry like `2026-07-29|08:30` (single-window mute)
+- Mute only affects proactive window notifications
 - Manual queries like `状态` still work while muted
-- Mute resets automatically on the next Singapore date
+- Both mute kinds reset automatically on the next Singapore date
 
 ## Runtime state store
 
@@ -132,14 +132,15 @@ Primary runtime state is stored in `state.db`.
 
 Stored fields include:
 
-- `alerts`
-  - dedupe state per `stop_id:service_no`
-  - remembers `lastArrivalTime`
-  - remembers `lastSentAt`
 - `telegramUpdateOffset`
   - last consumed Telegram update id plus one
 - `mutedUntilDateKey`
-  - optional same-day mute marker in Singapore date format
+  - optional whole-day mute marker in Singapore date format
+- `mutedWindowKeys`
+  - optional list of muted window occurrences, e.g. `["2026-07-29|08:30"]`
+- `windowNotices`
+  - per-window notice tracking: Telegram `messageId`, `lastText`, cached `weatherSummary`, `loggedServices`, `finalized`
+  - this is what guarantees at most one proactive message per window
 - `monitoredStops`
   - optional runtime override of monitored stops/services
 - `serviceThresholdMinutes`
@@ -149,14 +150,14 @@ Example:
 
 ```json
 {
-  "alerts": {
-    "17379:189": {
-      "lastArrivalTime": "2026-03-19T08:42:10+08:00",
-      "lastSentAt": "2026-03-19T08:37:00.000Z"
-    }
-  },
   "telegramUpdateOffset": 858834610,
-  "mutedUntilDateKey": "2026-03-19"
+  "mutedWindowKeys": ["2026-07-29|08:30"],
+  "windowNotices": {
+    "2026-07-29|08:30": {
+      "messageId": 2210,
+      "finalized": true
+    }
+  }
 }
 ```
 
@@ -282,10 +283,15 @@ Current config keys:
 - `BUS_ALERT_TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `TIMEZONE`
-- `ALERT_WINDOW_START`
-- `ALERT_WINDOW_END`
+- `ALERT_WINDOWS`
+  - comma-separated windows, e.g. `08:30-09:30,17:30-18:30`
+- `ALERT_WINDOW_START` / `ALERT_WINDOW_END`
+  - legacy single-window keys, merged into the window list
+- `EVENING_WINDOW_START` / `EVENING_WINDOW_END`
+  - legacy evening-window keys, merged into the window list
 - `ALERT_THRESHOLD_MINUTES`
 - `COOLDOWN_MINUTES`
+  - obsolete since the one-message-per-window redesign; ignored
 - `ARRIVAL_API_BASE`
 - `WEATHER_LATITUDE`
 - `WEATHER_LONGITUDE`
@@ -356,11 +362,11 @@ systemctl --user restart sg-bus-alert.timer
 - This project is intentionally dependency-free.
 - Do not introduce npm packages unless there is a strong reason.
 - Preserve the current Telegram command set unless the user asks to change it.
-- Preserve same-day mute semantics:
-  - `上车了` and `暂停` mute proactive notifications only
-  - `恢复` re-enables them
-  - manual status queries still work
-- Morning proactive notifications are merged into one message.
+- Preserve mute semantics:
+  - `上车了` mutes only the current/upcoming window today
+  - `暂停` mutes the whole day
+  - `恢复` clears both; manual status queries always work
+- Each alert window sends exactly one proactive message and then edits it in place; do not reintroduce repeated sends.
 - Query responses and proactive responses use different headers but share the same 3-arrival layout.
 - Weather is best-effort and should not break bus status replies if the weather API fails.
 - This machine already has working user-level `systemd`.

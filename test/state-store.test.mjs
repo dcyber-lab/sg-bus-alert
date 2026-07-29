@@ -106,6 +106,42 @@ test("writeState persists only to sqlite without creating a json state file", as
   }
 });
 
+test("writeState round-trips per-window mute state and window notices", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "sg-bus-alert-state-"));
+  const stateFile = path.join(tempDir, "state.json");
+
+  try {
+    const windowNotices = {
+      "2026-07-29|08:30": {
+        messageId: 4242,
+        lastText: "⏰ 晨间出行提醒\n\n🚌 189\n\n🔄 自动刷新中｜更新时间：08:37:00",
+        weatherSummary: "🌦️ 今天天气：阵雨",
+        loggedServices: ["17379:189"],
+        finalized: false,
+      },
+    };
+
+    await writeState(stateFile, {
+      alerts: {},
+      telegramUpdateOffset: 99,
+      mutedWindowKeys: ["2026-07-29|08:30"],
+      windowNotices,
+    });
+
+    const reloaded = await readState(stateFile);
+    assert.equal(reloaded.telegramUpdateOffset, 99);
+    assert.deepEqual(reloaded.mutedWindowKeys, ["2026-07-29|08:30"]);
+    assert.deepEqual(reloaded.windowNotices, windowNotices);
+
+    await writeState(stateFile, { alerts: {}, telegramUpdateOffset: 100 });
+    const cleared = await readState(stateFile);
+    assert.equal(cleared.mutedWindowKeys, undefined);
+    assert.equal(cleared.windowNotices, undefined);
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("logAlertToHistory writes into sqlite-backed history table", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "sg-bus-alert-state-"));
   const stateFile = path.join(tempDir, "state.json");
