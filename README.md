@@ -7,17 +7,19 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
 ## What it does
 
 - Monitors selected Singapore bus stops and bus services.
-- Sends proactive Telegram notifications on weekdays during configured windows (currently `08:30-09:30` and `17:30-18:30` in `Asia/Singapore`).
-- Each window sends exactly one notification message; afterwards the bot edits that same message in place on every polling cycle, so ETAs stay fresh without repeated pushes.
+- Runs as a long-lived daemon with Telegram long polling, so chat commands are answered almost instantly.
+- Sends proactive Telegram notifications on weekdays during configured windows (currently `08:30-09:30` and `17:30-18:30` in `Asia/Singapore`); Singapore public holidays are skipped.
+- Each window sends exactly one notification message; afterwards the bot edits that same message in place (roughly every 10s), so ETAs stay fresh without repeated pushes.
+- Optional walk-time departure pings: after `步行 <分钟>` is configured, the bot sends at most one extra "leave now" push per service per window when a catchable bus enters the walk-time band.
+- Stops can be limited to the morning or evening window via `设置时段` (e.g. home stops in the morning, office stops in the evening).
 - The window notification includes:
-  - weather summary
-  - the next 3 buses for every monitored service
+  - weather summary (Open-Meteo daily + data.gov.sg 2-hour nowcast)
+  - the next 3 buses for every monitored service in that window
   - current ETA, load, vehicle type, and arrival clock time
 - Supports Telegram chat commands for on-demand status lookup.
 - Supports boarding mute (`上车了`, current window only) and whole-day mute (`暂停`).
-- Uses a lock file so overlapping timer runs do not process state concurrently.
-- All outbound HTTP calls carry a 15s timeout; a hung run is killed by systemd after 90s (`TimeoutStartSec`).
-- Reuses bus-arrival and weather data within a single execution cycle.
+- Uses a lock file so a second instance exits cleanly instead of double-polling Telegram.
+- All outbound HTTP calls carry timeouts; if cycles keep failing, the bot sends a self-diagnosis warning to Telegram once the failure streak reaches the configured threshold.
 
 ## Current live configuration
 
@@ -45,9 +47,7 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
   - primary runtime state store in SQLite
   - stores Telegram update offset, mute state (whole-day and per-window), window notice tracking, monitored stops, and thresholds
 - `~/.config/systemd/user/sg-bus-alert.service`
-  - runs the script once, killed after 90s if it hangs
-- `~/.config/systemd/user/sg-bus-alert.timer`
-  - runs the service every 10 seconds
+  - long-running daemon (`Type=simple`, `Restart=always`); the old 10-second timer no longer exists
 - `.sg-bus-alert.lock`
   - runtime lock file in the project directory
   - stale lock is recovered automatically when the owning process is gone
@@ -109,6 +109,10 @@ After the first send, no further messages are pushed for that window. The bot si
   - remove a monitored service
 - `阈值 189 6`
   - set per-service proactive reminder threshold to 6 minutes
+- `步行 5` / `步行 17379 6` / `步行 关`
+  - configure walk-to-stop minutes (default / per stop / off); enables one "leave now" push per service per window when a bus ETA enters the `[walk, walk+2]` minute band
+- `设置时段 17051 晚`
+  - limit a stop to the morning (`早`) or evening (`晚`) window; `全部` resets it
 - `上车了`
   - mute the current (or next upcoming) alert window for today; other windows still fire
 - `暂停`
@@ -142,9 +146,15 @@ Stored fields include:
   - per-window notice tracking: Telegram `messageId`, `lastText`, cached `weatherSummary`, `loggedServices`, `finalized`
   - this is what guarantees at most one proactive message per window
 - `monitoredStops`
-  - optional runtime override of monitored stops/services
+  - optional runtime override of monitored stops/services; each stop may carry a `periods` array (`["早"]` / `["晚"]`) restricting it to one window
 - `serviceThresholdMinutes`
   - optional per-service threshold overrides
+- `walkMinutesDefault` / `walkMinutesByStop`
+  - walk-time config driving the departure pings
+- `departurePings`
+  - per-window record of services already pinged (max one push per service per window)
+- `failureStreak`
+  - consecutive failed daemon cycles, used for the self-diagnosis alert
 
 Example:
 
@@ -246,10 +256,17 @@ Example:
 curl -fsSL 'https://api.open-meteo.com/v1/forecast?latitude=1.3179&longitude=103.7631&timezone=Asia%2FSingapore&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=1'
 ```
 
-Important implementation detail:
+Additionally, a 2-hour nowcast for the configured area comes from data.gov.sg:
+
+```bash
+curl -fsSL 'https://api-open.data.gov.sg/v2/real-time/api/two-hr-forecast'
+```
+
+Important implementation details:
 
 - Node `fetch()` to Open-Meteo failed on this machine in some cases
 - the script now falls back to `curl -fsSL` for weather if `fetch()` fails
+- both weather sources are cached for 10 minutes and are strictly best-effort
 
 ### 4. Telegram Bot API
 
@@ -271,10 +288,10 @@ curl -fsSL -X POST "https://api.telegram.org/bot<token>/sendMessage" \
 
 Important implementation detail:
 
-- this project uses polling via `getUpdates`
+- this project uses long polling via `getUpdates` (20s idle, 5s during alert windows)
 - no webhook is configured
-- polling frequency is controlled by the `systemd` timer, currently every 10 seconds
-- overlapping timer runs are skipped cleanly by the lock file
+- proactive checks tick roughly every 10 seconds during alert windows
+- a second instance exits cleanly thanks to the lock file, so `getUpdates` is never polled twice
 
 ## Environment variables
 
@@ -295,6 +312,12 @@ Current config keys:
 - `ARRIVAL_API_BASE`
 - `WEATHER_LATITUDE`
 - `WEATHER_LONGITUDE`
+- `WEATHER_NOWCAST_AREA`
+  - data.gov.sg forecast area name, default `Clementi`
+- `PUBLIC_HOLIDAYS`
+  - optional comma-separated `YYYY-MM-DD` dates appended to the built-in Singapore holiday table (`DEFAULT_SG_PUBLIC_HOLIDAYS` in `index.mjs`, refresh yearly)
+- `FAILURE_ALERT_AFTER`
+  - consecutive failed cycles before the self-diagnosis warning, default `30`
 - `STATE_FILE`
   - legacy JSON migration source path; corresponding `.db` path is used as the primary runtime store
 - `STOP_CONFIG_JSON`
@@ -318,27 +341,7 @@ Example monitored stop config:
 
 ## Commands for local operation
 
-Run one cycle:
-
-```bash
-cd /home/minipc/sg-bus-alert
-node index.mjs
-```
-
-Send test message:
-
-```bash
-cd /home/minipc/sg-bus-alert
-node index.mjs test
-```
-
-Check timer:
-
-```bash
-systemctl --user status sg-bus-alert.timer --no-pager
-```
-
-Check service:
+Check the daemon:
 
 ```bash
 systemctl --user status sg-bus-alert.service --no-pager
@@ -350,11 +353,22 @@ Check logs:
 journalctl --user -u sg-bus-alert.service -n 50 --no-pager
 ```
 
-Restart timer:
+Restart the daemon (required after editing `.env`):
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user restart sg-bus-alert.timer
+systemctl --user restart sg-bus-alert.service
+```
+
+Run a single debug cycle (stop the daemon first, otherwise the lock makes this exit immediately):
+
+```bash
+node index.mjs once
+```
+
+Send test message:
+
+```bash
+node index.mjs test
 ```
 
 ## Implementation notes for future AI agents
@@ -369,9 +383,11 @@ systemctl --user restart sg-bus-alert.timer
 - Each alert window sends exactly one proactive message and then edits it in place; do not reintroduce repeated sends.
 - Query responses and proactive responses use different headers but share the same 3-arrival layout.
 - Weather is best-effort and should not break bus status replies if the weather API fails.
-- This machine already has working user-level `systemd`.
-- Polling is intentionally timer-based, not webhook-based.
-- Overlapping timer invocations should be prevented with the runtime lock rather than by assuming the timer never overlaps.
+- This machine already has working user-level `systemd` with lingering enabled.
+- The bot is a long-lived daemon using Telegram long polling; webhooks and the old 10-second timer are both intentionally not used.
+- `.env` is read once at startup — restart the service after config changes.
+- The runtime lock guarantees a second instance (e.g. a manual `node index.mjs`) exits cleanly instead of double-polling Telegram.
+- State is persisted only when it changes, so the SQLite file is not rewritten on idle cycles.
 
 ## Security note
 

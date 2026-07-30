@@ -12,10 +12,14 @@ import {
   buildHelpMessage,
   buildTelegramButtons,
   parseAlertWindows,
+  parseDateKeySet,
   parseServiceCallbackData,
   pickBoardedWindow,
+  pickDepartureCandidate,
   releaseRunLock,
+  stopsForPeriod,
   windowKeyFor,
+  windowPeriodKey,
   windowPeriodLabel,
 } from "./lib/runtime-helpers.mjs";
 import {
@@ -27,6 +31,58 @@ import {
 const ENV_PATH = path.join(process.cwd(), ".env");
 const execFileAsync = promisify(execFile);
 const FETCH_TIMEOUT_MS = 15 * 1000;
+const WEATHER_TTL_MS = 10 * 60 * 1000;
+const WEATHER_RETRY_MS = 60 * 1000;
+const PROACTIVE_TICK_MS = 9 * 1000;
+const HEARTBEAT_MS = 60 * 60 * 1000;
+
+// MOM-announced Singapore public holidays; refresh once a year, extend via PUBLIC_HOLIDAYS env.
+const DEFAULT_SG_PUBLIC_HOLIDAYS = [
+  "2026-01-01",
+  "2026-02-17",
+  "2026-02-18",
+  "2026-03-21",
+  "2026-04-03",
+  "2026-05-01",
+  "2026-05-27",
+  "2026-05-31",
+  "2026-06-01",
+  "2026-08-09",
+  "2026-08-10",
+  "2026-11-08",
+  "2026-11-09",
+  "2026-12-25",
+];
+
+const NOWCAST_LABELS = {
+  "Fair (Day)": "晴好",
+  "Fair (Night)": "晴好",
+  "Fair & Warm": "晴热",
+  "Partly Cloudy (Day)": "局部多云",
+  "Partly Cloudy (Night)": "局部多云",
+  Cloudy: "多云",
+  Overcast: "阴",
+  Drizzle: "毛毛雨",
+  "Light Rain": "小雨",
+  "Moderate Rain": "中雨",
+  "Heavy Rain": "大雨",
+  "Passing Showers": "短暂阵雨",
+  "Light Showers": "小阵雨",
+  Showers: "阵雨",
+  "Heavy Showers": "强阵雨",
+  "Thundery Showers": "雷阵雨",
+  "Heavy Thundery Showers": "强雷阵雨",
+  "Heavy Thundery Showers with Gusty Winds": "强雷阵雨伴阵风",
+  Hazy: "有霾",
+  "Slightly Hazy": "轻霾",
+  Windy: "有风",
+  Mist: "薄雾",
+  Fog: "有雾",
+};
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function logInfo(message) {
   console.log(`[sg-bus-alert] ${message}`);
@@ -138,21 +194,6 @@ function isWithinWindow(date, timeZone, start, end) {
 
   const currentMinute = hour * 60 + minute;
   return currentMinute >= getMinuteOfDay(start) && currentMinute <= getMinuteOfDay(end);
-}
-
-function formatLocalDateTime(date, timeZone) {
-  const formatter = new Intl.DateTimeFormat("zh-CN", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-
-  return formatter.format(date);
 }
 
 function loadLabel(code) {
@@ -416,11 +457,51 @@ async function fetchArrivalsCached(apiBase, stopId, runCache) {
   return runCache.arrivals.get(stopId);
 }
 
-async function fetchWeatherCached(weatherConfig, runCache) {
-  if (!runCache.weather) {
-    runCache.weather = fetchWeather(weatherConfig);
+async function fetchNowcastLine(area) {
+  const json = await fetchJson("https://api-open.data.gov.sg/v2/real-time/api/two-hr-forecast");
+  const forecasts = json?.data?.items?.[0]?.forecasts || [];
+  const match = forecasts.find((item) => item.area === area);
+  if (!match?.forecast) {
+    return null;
   }
-  return runCache.weather;
+  return `🌧 未来两小时（${area}）：${NOWCAST_LABELS[match.forecast] || match.forecast}`;
+}
+
+async function getWeatherSummaryCached(context, weatherConfig, nowcastArea) {
+  const cache = context.weatherCache;
+  const nowMs = Date.now();
+
+  if (cache.summary !== null && nowMs - cache.fetchedAt < WEATHER_TTL_MS) {
+    return cache.summary;
+  }
+  if (nowMs - cache.lastAttemptAt < WEATHER_RETRY_MS) {
+    return cache.summary;
+  }
+  cache.lastAttemptAt = nowMs;
+
+  try {
+    const weather = await fetchWeather(weatherConfig);
+    let summary = buildWeatherMessage(weather);
+    let nowcastLine = null;
+    try {
+      nowcastLine = await fetchNowcastLine(nowcastArea);
+    } catch {
+      nowcastLine = null;
+    }
+    if (summary && nowcastLine) {
+      summary = `${summary}\n${nowcastLine}`;
+    } else if (nowcastLine) {
+      summary = nowcastLine;
+    }
+    if (summary) {
+      cache.summary = summary;
+      cache.fetchedAt = nowMs;
+    }
+  } catch {
+    // keep the stale summary; retry after WEATHER_RETRY_MS
+  }
+
+  return cache.summary;
 }
 
 async function sendTelegram(token, chatId, text) {
@@ -530,15 +611,15 @@ async function editTelegramMessageText(token, chatId, messageId, text, replyMark
   }
 }
 
-async function fetchTelegramUpdates(token, offset) {
-  const params = new URLSearchParams({ timeout: "0" });
+async function fetchTelegramUpdates(token, offset, timeoutSeconds = 0) {
+  const params = new URLSearchParams({ timeout: String(timeoutSeconds) });
   if (typeof offset === "number") {
     params.set("offset", String(offset));
   }
 
   const response = await fetch(
     `https://api.telegram.org/bot${token}/getUpdates?${params.toString()}`,
-    { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
+    { signal: AbortSignal.timeout(Math.max(FETCH_TIMEOUT_MS, (timeoutSeconds + 10) * 1000)) },
   );
 
   if (!response.ok) {
@@ -622,9 +703,17 @@ function buildStatusMessage(items, timeZone, stops, weatherSummary = null, muteS
 
 function buildConfigMessage(stops, state, defaultThresholdMinutes) {
   const lines = ["⚙️ 当前配置", ""];
+  const walkByStop = state.walkMinutesByStop || {};
 
   for (const stop of stops) {
-    lines.push(`📍 ${stop.stop_name} (${stop.stop_id})`);
+    const periodSuffix =
+      Array.isArray(stop.periods) && stop.periods.length > 0
+        ? `｜仅${stop.periods.join("、")}高峰`
+        : "";
+    lines.push(`📍 ${stop.stop_name} (${stop.stop_id})${periodSuffix}`);
+    if (Number.isFinite(walkByStop[stop.stop_id])) {
+      lines.push(`   🚶 步行 ${walkByStop[stop.stop_id]} 分钟`);
+    }
     if (!Array.isArray(stop.services) || stop.services.length === 0) {
       lines.push("   暂无监控线路");
     } else {
@@ -636,12 +725,38 @@ function buildConfigMessage(stops, state, defaultThresholdMinutes) {
     lines.push("");
   }
 
+  if (Number.isFinite(state.walkMinutesDefault)) {
+    lines.push(`🚶 默认步行时间：${state.walkMinutesDefault} 分钟（出门提醒已开启）`);
+  } else if (Object.keys(walkByStop).length > 0) {
+    lines.push("🚶 出门提醒：仅对已设置步行时间的站点开启");
+  } else {
+    lines.push("🚶 出门提醒未开启（发送：步行 <分钟>）");
+  }
+  lines.push("");
+
   lines.push("可用命令：");
   lines.push("添加站点 <ID> <名称>");
   lines.push("删除站点 <ID>");
   lines.push("添加线路 <线路号> <站点ID/名称>");
   lines.push("删除线路 <线路号> <站点ID/名称>");
   lines.push("阈值 <线路号> <分钟>");
+  lines.push("步行 <分钟> / 步行 <站点ID> <分钟> / 步行 关");
+  lines.push("设置时段 <站点ID> 早|晚|全部");
+  return lines.join("\n");
+}
+
+function buildDeparturePingMessage(pings, timeZone) {
+  const lines = ["🏃 现在出门，正好赶上", ""];
+
+  pings.forEach((ping, index) => {
+    lines.push(`🚌 ${ping.serviceNo}｜${minutesLabel(ping.arrival.duration_ms)}后到｜步行 ${ping.walkMinutes} 分钟`);
+    lines.push(`📍 ${ping.stop.stop_name}`);
+    lines.push(`🕒 到站 ${formatArrivalClock(ping.arrival.time, timeZone)}`);
+    if (index !== pings.length - 1) {
+      lines.push("");
+    }
+  });
+
   return lines.join("\n");
 }
 
@@ -755,6 +870,20 @@ function cleanupState(state, nowIso, timeZone) {
       delete notices[key];
     }
   }
+
+  const pings = state.departurePings;
+  if (pings && typeof pings === "object" && !Array.isArray(pings)) {
+    for (const key of Object.keys(pings)) {
+      if (!key.startsWith(`${todayKey}|`)) {
+        delete pings[key];
+      }
+    }
+    if (Object.keys(pings).length === 0) {
+      delete state.departurePings;
+    }
+  } else if (pings !== undefined) {
+    delete state.departurePings;
+  }
 }
 
 async function fetchCurrentStatuses(apiBase, stops, timeZone, runCache, requestedServices = null) {
@@ -847,21 +976,233 @@ async function finalizeWindowNotice(token, chatId, notice, footerLine, replyMark
   }
 }
 
-async function processTelegramCommands(
-  token,
-  chatId,
-  state,
-  apiBase,
-  stops,
-  timeZone,
-  weatherConfig,
-  defaultThresholdMinutes,
-  runCache,
-  alertWindows,
-) {
+async function proactiveTick(context, now) {
+  const {
+    token,
+    chatId,
+    state,
+    apiBase,
+    stops,
+    timeZone,
+    defaultThresholdMinutes,
+    runCache,
+    alertWindows,
+    stateFile,
+    holidays,
+  } = context;
+
+  const todayKey = formatDateKey(now, timeZone);
+  const notices = getWindowNotices(state);
+  const nowClock = formatArrivalClock(now.toISOString(), timeZone);
+
+  for (const [key, notice] of Object.entries(notices)) {
+    if (!notice || notice.finalized) {
+      continue;
+    }
+    const [noticeDateKey, windowStart] = key.split("|");
+    const window = alertWindows.find((item) => item.start === windowStart);
+    const stillActive =
+      noticeDateKey === todayKey &&
+      window &&
+      isWithinWindow(now, timeZone, window.start, window.end);
+    if (stillActive) {
+      continue;
+    }
+    await finalizeWindowNotice(
+      token,
+      chatId,
+      notice,
+      `⏹ 本时段提醒已结束｜最后更新：${nowClock}`,
+      buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
+    );
+    logInfo(`window notice finalized for ${key}`);
+  }
+
+  let activeWindow = findActiveWindow(now, timeZone, alertWindows);
+  if (activeWindow && holidays.has(todayKey)) {
+    if (context.holidayLoggedFor !== todayKey) {
+      logInfo(`public holiday ${todayKey}, proactive notifications skipped`);
+      context.holidayLoggedFor = todayKey;
+    }
+    activeWindow = null;
+  }
+  if (!activeWindow) {
+    return;
+  }
+
+  const windowKey = windowKeyFor(todayKey, activeWindow);
+  const windowMuted = isDayMuted(state, todayKey) || getMutedWindowKeys(state).includes(windowKey);
+
+  if (windowMuted) {
+    const notice = notices[windowKey];
+    if (notice && !notice.finalized) {
+      await finalizeWindowNotice(
+        token,
+        chatId,
+        notice,
+        isDayMuted(state, todayKey) ? "🔕 今天提醒已暂停" : "🛑 已上车，本时段提醒结束",
+        buildTelegramButtons(stops, true),
+      );
+    }
+    return;
+  }
+
+  const windowStops = stopsForPeriod(stops, windowPeriodKey(activeWindow));
+  if (windowStops.length === 0) {
+    return;
+  }
+
+  const { items, triggered } = await evaluateWindowServices(
+    apiBase,
+    windowStops,
+    state,
+    defaultThresholdMinutes,
+    runCache,
+  );
+  const periodLabel = windowPeriodLabel(activeWindow);
+  const existingNotice = notices[windowKey];
+
+  if (!existingNotice) {
+    if (triggered.length > 0 && items.length > 0) {
+      const weatherSummary = await context.getWeatherSummary();
+      const text = buildWindowNoticeMessage(
+        items,
+        timeZone,
+        weatherSummary,
+        periodLabel,
+        true,
+        `🔄 自动刷新中｜更新时间：${nowClock}`,
+      );
+      const sent = await sendTelegramMessage(token, {
+        chat_id: chatId,
+        text,
+        disable_web_page_preview: true,
+        reply_markup: buildTelegramButtons(stops, false),
+      });
+
+      const notice = {
+        messageId: sent?.message_id || null,
+        lastText: text,
+        loggedServices: [],
+        finalized: !sent?.message_id,
+      };
+      notices[windowKey] = notice;
+
+      for (const item of triggered) {
+        notice.loggedServices.push(item.key);
+        await logAlertToHistoryFromStore(stateFile, item.stopId, item.serviceNo, item.arrivalTime);
+      }
+      logInfo(
+        `window notice sent for ${windowKey}${notice.messageId ? ` message_id=${notice.messageId}` : ""}`,
+      );
+    }
+  } else if (!existingNotice.finalized) {
+    const weatherSummary = await context.getWeatherSummary();
+    const text = buildWindowNoticeMessage(
+      items,
+      timeZone,
+      weatherSummary,
+      periodLabel,
+      triggered.length > 0,
+      `🔄 自动刷新中｜更新时间：${nowClock}`,
+    );
+
+    if (text !== existingNotice.lastText && existingNotice.messageId) {
+      try {
+        await editTelegramMessageText(
+          token,
+          chatId,
+          existingNotice.messageId,
+          text,
+          buildTelegramButtons(stops, false),
+        );
+        existingNotice.lastText = text;
+        logInfo(`window notice refreshed for ${windowKey}`);
+      } catch (error) {
+        if (error.message.includes("message to edit not found")) {
+          existingNotice.finalized = true;
+          logInfo("window notice message was deleted, stopping refresh for this window");
+        } else {
+          throw error;
+        }
+      }
+    }
+
+    if (!Array.isArray(existingNotice.loggedServices)) {
+      existingNotice.loggedServices = [];
+    }
+    for (const item of triggered) {
+      if (existingNotice.loggedServices.includes(item.key)) {
+        continue;
+      }
+      existingNotice.loggedServices.push(item.key);
+      await logAlertToHistoryFromStore(stateFile, item.stopId, item.serviceNo, item.arrivalTime);
+    }
+  }
+
+  const walkDefault = Number.isFinite(state.walkMinutesDefault) ? state.walkMinutesDefault : null;
+  const walkByStop =
+    state.walkMinutesByStop && typeof state.walkMinutesByStop === "object"
+      ? state.walkMinutesByStop
+      : {};
+  const pings = [];
+  for (const item of items) {
+    const walkMinutes = Number.isFinite(walkByStop[item.stop.stop_id])
+      ? walkByStop[item.stop.stop_id]
+      : walkDefault;
+    if (!Number.isFinite(walkMinutes) || walkMinutes <= 0) {
+      continue;
+    }
+    const rowKey = `${item.stop.stop_id}:${item.serviceNo}`;
+    if (state.departurePings?.[windowKey]?.includes(rowKey)) {
+      continue;
+    }
+    const candidate = pickDepartureCandidate(item.arrivals, walkMinutes);
+    if (!candidate) {
+      continue;
+    }
+    pings.push({ stop: item.stop, serviceNo: item.serviceNo, arrival: candidate, walkMinutes, rowKey });
+  }
+
+  if (pings.length > 0) {
+    await sendTelegramMessage(token, {
+      chat_id: chatId,
+      text: buildDeparturePingMessage(pings, timeZone),
+      disable_web_page_preview: true,
+      reply_markup: buildTelegramButtons(stops, false),
+    });
+    if (
+      !state.departurePings ||
+      typeof state.departurePings !== "object" ||
+      Array.isArray(state.departurePings)
+    ) {
+      state.departurePings = {};
+    }
+    if (!Array.isArray(state.departurePings[windowKey])) {
+      state.departurePings[windowKey] = [];
+    }
+    for (const ping of pings) {
+      state.departurePings[windowKey].push(ping.rowKey);
+      logInfo(`departure ping sent for ${ping.rowKey} (walk ${ping.walkMinutes}m)`);
+    }
+  }
+}
+
+async function processTelegramCommands(context, pollSeconds) {
+  const {
+    token,
+    chatId,
+    state,
+    apiBase,
+    stops,
+    timeZone,
+    defaultThresholdMinutes,
+    runCache,
+    alertWindows,
+  } = context;
   const offset =
     typeof state.telegramUpdateOffset === "number" ? state.telegramUpdateOffset : undefined;
-  const updates = await fetchTelegramUpdates(token, offset);
+  const updates = await fetchTelegramUpdates(token, offset, pollSeconds);
 
   for (const update of updates) {
     state.telegramUpdateOffset = update.update_id + 1;
@@ -1301,6 +1642,102 @@ async function processTelegramCommands(
         reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
       });
       continue;
+    } else if (/^步行(\s|$)/.test(text)) {
+      const parts = text.split(/\s+/);
+      const replyMarkup = buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows));
+      let replyText = null;
+
+      if (parts.length === 1) {
+        const byStop = state.walkMinutesByStop || {};
+        const overrides = Object.entries(byStop)
+          .map(([stopId, minutes]) => `${stopId} → ${minutes} 分钟`)
+          .join("；");
+        if (Number.isFinite(state.walkMinutesDefault)) {
+          replyText = `🚶 默认步行 ${state.walkMinutesDefault} 分钟${overrides ? `；${overrides}` : ""}`;
+        } else if (overrides) {
+          replyText = `🚶 站点步行时间：${overrides}`;
+        } else {
+          replyText = "🚶 出门提醒未开启。";
+        }
+        replyText += "\n\n用法：\n步行 5（默认步行分钟）\n步行 17379 6（按站点）\n步行 关（关闭出门提醒）";
+      } else if (parts[1] === "关") {
+        delete state.walkMinutesDefault;
+        delete state.walkMinutesByStop;
+        replyText = "🚶 出门提醒已关闭。";
+      } else if (parts.length === 2 && /^\d{1,3}$/.test(parts[1])) {
+        const minutes = Number(parts[1]);
+        if (minutes < 1 || minutes > 120) {
+          replyText = "步行时间需要在 1-120 分钟之间。";
+        } else {
+          state.walkMinutesDefault = minutes;
+          replyText = `🚶 已设置默认步行时间 ${minutes} 分钟。\n某班车 ETA 进入 ${minutes}-${minutes + 2} 分钟区间时，会提醒你出门。`;
+        }
+      } else if (parts.length === 3 && isValidStopId(parts[1]) && /^\d{1,3}$/.test(parts[2])) {
+        const minutes = Number(parts[2]);
+        const walkStop = stops.find((stop) => stop.stop_id === parts[1]);
+        if (!walkStop) {
+          replyText = `站点 ${parts[1]} 不在监控配置中。`;
+        } else if (minutes < 1 || minutes > 120) {
+          replyText = "步行时间需要在 1-120 分钟之间。";
+        } else {
+          state.walkMinutesByStop = { ...(state.walkMinutesByStop || {}), [parts[1]]: minutes };
+          replyText = `🚶 已设置 ${walkStop.stop_name} (${parts[1]}) 步行时间 ${minutes} 分钟。`;
+        }
+      } else {
+        replyText = "用法：\n步行 5（默认步行分钟）\n步行 17379 6（按站点）\n步行 关（关闭出门提醒）";
+      }
+
+      await sendTelegramMessage(token, {
+        chat_id: chatId,
+        text: replyText,
+        reply_to_message_id: message.message_id,
+        disable_web_page_preview: true,
+        reply_markup: replyMarkup,
+      });
+      continue;
+    } else if (/^设置时段(\s|$)/.test(text)) {
+      const match = /^设置时段\s+(\S+)\s+(早|晚|全部)$/.exec(text);
+      const replyMarkup = buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows));
+
+      if (!match) {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: "用法：设置时段 <站点ID或名称> 早|晚|全部",
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: replyMarkup,
+        });
+        continue;
+      }
+
+      const periodStop = findStopByIdentifier(stops, match[1]);
+      if (!periodStop) {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: "没有找到你指定的站点，可用站点请先发送：配置",
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: replyMarkup,
+        });
+        continue;
+      }
+
+      if (match[2] === "全部") {
+        delete periodStop.periods;
+      } else {
+        periodStop.periods = [match[2]];
+      }
+      state.monitoredStops = cloneStops(stops);
+      await sendTelegramMessage(token, {
+        chat_id: chatId,
+        text: `✅ ${periodStop.stop_name} (${periodStop.stop_id}) 现在${
+          match[2] === "全部" ? "在所有时段提醒" : `只在${match[2]}高峰时段提醒`
+        }。`,
+        reply_to_message_id: message.message_id,
+        disable_web_page_preview: true,
+        reply_markup: replyMarkup,
+      });
+      continue;
     } else {
       await sendTelegramMessage(token, {
         chat_id: chatId,
@@ -1326,13 +1763,7 @@ async function processTelegramCommands(
       continue;
     }
 
-    let weatherSummary = null;
-    try {
-      const weather = await fetchWeatherCached(weatherConfig, runCache);
-      weatherSummary = buildWeatherMessage(weather);
-    } catch (error) {
-      weatherSummary = null;
-    }
+    const weatherSummary = await context.getWeatherSummary();
 
     const muteStatus = describeMuteStatus(state, todayKey, alertWindows);
 
@@ -1374,6 +1805,16 @@ async function main() {
     longitude: env.WEATHER_LONGITUDE || "103.7631",
     timezone: timeZone,
   };
+  const nowcastArea = env.WEATHER_NOWCAST_AREA || "Clementi";
+  const holidays = parseDateKeySet(env.PUBLIC_HOLIDAYS);
+  for (const key of DEFAULT_SG_PUBLIC_HOLIDAYS) {
+    holidays.add(key);
+  }
+  const parsedFailureAlertAfter = Number(env.FAILURE_ALERT_AFTER);
+  const failureAlertAfter =
+    Number.isFinite(parsedFailureAlertAfter) && parsedFailureAlertAfter > 0
+      ? parsedFailureAlertAfter
+      : 30;
   const stateFile = path.resolve(process.cwd(), env.STATE_FILE || "./state.json");
   const lockFile = path.join(path.dirname(stateFile), ".sg-bus-alert.lock");
   const defaultStops = JSON.parse(required(env, "STOP_CONFIG_JSON"));
@@ -1395,13 +1836,12 @@ async function main() {
     return;
   }
 
-  const now = new Date();
   const token = env.BUS_ALERT_TELEGRAM_BOT_TOKEN || required(env, "TELEGRAM_BOT_TOKEN");
   const chatId = required(env, "TELEGRAM_CHAT_ID");
   const lock = await acquireRunLock(lockFile);
   if (!lock.acquired) {
     const pid = lock.activeLock?.pid ? ` pid=${lock.activeLock.pid}` : "";
-    logInfo(`another run is active, skipping this cycle cleanly${pid}`);
+    logInfo(`another instance is active, exiting cleanly${pid}`);
     return;
   }
 
@@ -1415,207 +1855,121 @@ async function main() {
     } catch {
       // lock already gone
     }
-    process.exit(1);
+    process.exit(0);
   };
   process.once("SIGTERM", releaseLockOnSignal);
   process.once("SIGINT", releaseLockOnSignal);
 
   try {
-    const runCache = {
-      arrivals: new Map(),
-      weather: null,
-    };
     const state = await readStateFromStore(stateFile);
+    const context = {
+      token,
+      chatId,
+      state,
+      apiBase,
+      timeZone,
+      alertWindows,
+      defaultThresholdMinutes: maxMinutes,
+      stateFile,
+      holidays,
+      stops: [],
+      runCache: null,
+      weatherCache: { summary: null, fetchedAt: 0, lastAttemptAt: 0 },
+      holidayLoggedFor: null,
+      lastWindowLog: null,
+    };
+    context.getWeatherSummary = () => getWeatherSummaryCached(context, weatherConfig, nowcastArea);
 
-    try {
-      const stops = loadEffectiveStops(state, defaultStops);
-      cleanupState(state, now.toISOString(), timeZone);
-
-      const activeWindow = findActiveWindow(now, timeZone, alertWindows);
-      const todayKey = formatDateKey(now, timeZone);
-
-      logInfo(
-        `run at ${formatLocalDateTime(now, timeZone)} ${timeZone}, active_window=${
-          activeWindow ? `${activeWindow.start}-${activeWindow.end}` : "none"
-        }, muted=${isProactiveMutedNow(state, timeZone, alertWindows) ? "yes" : "no"}`,
-      );
-
-      await processTelegramCommands(
-        token,
-        chatId,
-        state,
-        apiBase,
-        stops,
-        timeZone,
-        weatherConfig,
-        maxMinutes,
-        runCache,
-        alertWindows,
-      );
-
-      const notices = getWindowNotices(state);
-      const nowClock = formatArrivalClock(now.toISOString(), timeZone);
-
-      for (const [key, notice] of Object.entries(notices)) {
-        if (!notice || notice.finalized) {
-          continue;
-        }
-        const [noticeDateKey, windowStart] = key.split("|");
-        const window = alertWindows.find((item) => item.start === windowStart);
-        const stillActive =
-          noticeDateKey === todayKey &&
-          window &&
-          isWithinWindow(now, timeZone, window.start, window.end);
-        if (stillActive) {
-          continue;
-        }
-        await finalizeWindowNotice(
-          token,
-          chatId,
-          notice,
-          `⏹ 本时段提醒已结束｜最后更新：${nowClock}`,
-          buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
-        );
-        logInfo(`window notice finalized for ${key}`);
-      }
-
-      if (!activeWindow) {
-        logInfo("outside configured alert windows, proactive notification skipped");
-        return;
-      }
-
-      const windowKey = windowKeyFor(todayKey, activeWindow);
-      const windowMuted =
-        isDayMuted(state, todayKey) || getMutedWindowKeys(state).includes(windowKey);
-
-      if (windowMuted) {
-        const notice = notices[windowKey];
-        if (notice && !notice.finalized) {
-          await finalizeWindowNotice(
-            token,
-            chatId,
-            notice,
-            isDayMuted(state, todayKey) ? "🔕 今天提醒已暂停" : "🛑 已上车，本时段提醒结束",
-            buildTelegramButtons(stops, true),
-          );
-        }
-        logInfo("active window is muted for today, proactive notification skipped");
-        return;
-      }
-
-      const { items, triggered } = await evaluateWindowServices(
-        apiBase,
-        stops,
-        state,
-        maxMinutes,
-        runCache,
-      );
-      const periodLabel = windowPeriodLabel(activeWindow);
-      const existingNotice = notices[windowKey];
-
-      if (!existingNotice) {
-        if (triggered.length === 0 || items.length === 0) {
-          logInfo("no services matched proactive threshold in this run");
-          return;
-        }
-
-        let weatherSummary = null;
-        try {
-          const weather = await fetchWeatherCached(weatherConfig, runCache);
-          weatherSummary = buildWeatherMessage(weather);
-        } catch (error) {
-          weatherSummary = null;
-        }
-
-        const text = buildWindowNoticeMessage(
-          items,
-          timeZone,
-          weatherSummary,
-          periodLabel,
-          true,
-          `🔄 自动刷新中｜更新时间：${nowClock}`,
-        );
-        const sent = await sendTelegramMessage(token, {
-          chat_id: chatId,
-          text,
-          disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, false),
-        });
-
-        const notice = {
-          messageId: sent?.message_id || null,
-          lastText: text,
-          weatherSummary,
-          loggedServices: [],
-          finalized: !sent?.message_id,
-        };
-        notices[windowKey] = notice;
-
-        for (const item of triggered) {
-          notice.loggedServices.push(item.key);
-          await logAlertToHistoryFromStore(stateFile, item.stopId, item.serviceNo, item.arrivalTime);
-        }
-        logInfo(
-          `window notice sent for ${windowKey}${notice.messageId ? ` message_id=${notice.messageId}` : ""}`,
-        );
-      } else if (!existingNotice.finalized) {
-        if (existingNotice.weatherSummary == null) {
-          try {
-            const weather = await fetchWeatherCached(weatherConfig, runCache);
-            existingNotice.weatherSummary = buildWeatherMessage(weather);
-          } catch (error) {
-            existingNotice.weatherSummary = null;
-          }
-        }
-
-        const text = buildWindowNoticeMessage(
-          items,
-          timeZone,
-          existingNotice.weatherSummary,
-          periodLabel,
-          triggered.length > 0,
-          `🔄 自动刷新中｜更新时间：${nowClock}`,
-        );
-
-        if (text !== existingNotice.lastText && existingNotice.messageId) {
-          try {
-            await editTelegramMessageText(
-              token,
-              chatId,
-              existingNotice.messageId,
-              text,
-              buildTelegramButtons(stops, false),
-            );
-            existingNotice.lastText = text;
-            logInfo(`window notice refreshed for ${windowKey}`);
-          } catch (error) {
-            if (error.message.includes("message to edit not found")) {
-              existingNotice.finalized = true;
-              logInfo("window notice message was deleted, stopping refresh for this window");
-            } else {
-              throw error;
-            }
-          }
-        }
-
-        if (!Array.isArray(existingNotice.loggedServices)) {
-          existingNotice.loggedServices = [];
-        }
-        for (const item of triggered) {
-          if (existingNotice.loggedServices.includes(item.key)) {
-            continue;
-          }
-          existingNotice.loggedServices.push(item.key);
-          await logAlertToHistoryFromStore(stateFile, item.stopId, item.serviceNo, item.arrivalTime);
-        }
-      }
-    } finally {
-      try {
+    let lastPersisted = JSON.stringify(state);
+    const persistIfDirty = async () => {
+      const snapshot = JSON.stringify(state);
+      if (snapshot !== lastPersisted) {
         await writeStateFromStore(stateFile, state);
+        lastPersisted = snapshot;
+      }
+    };
+
+    const singleCycle = mode === "once";
+    let lastProactiveAt = 0;
+    let lastHeartbeatAt = Date.now();
+
+    logInfo(
+      `daemon started, windows=${alertWindows.map((w) => `${w.start}-${w.end}`).join(",")}, timezone=${timeZone}`,
+    );
+
+    do {
+      let cycleFailed = false;
+      try {
+        const now = new Date();
+        context.stops = loadEffectiveStops(state, defaultStops);
+        context.runCache = { arrivals: new Map() };
+        cleanupState(state, now.toISOString(), timeZone);
+
+        const activeWindow = findActiveWindow(now, timeZone, alertWindows);
+        const windowLogValue = activeWindow
+          ? `${activeWindow.start}-${activeWindow.end}`
+          : "none";
+        if (windowLogValue !== context.lastWindowLog) {
+          logInfo(
+            `window state: ${windowLogValue}, muted=${isProactiveMutedNow(state, timeZone, alertWindows) ? "yes" : "no"}`,
+          );
+          context.lastWindowLog = windowLogValue;
+        }
+
+        const pollSeconds = singleCycle ? 0 : activeWindow ? 5 : 20;
+        await processTelegramCommands(context, pollSeconds);
+
+        if (singleCycle || Date.now() - lastProactiveAt >= PROACTIVE_TICK_MS) {
+          lastProactiveAt = Date.now();
+          await proactiveTick(context, new Date());
+        }
+
+        if ((state.failureStreak || 0) >= failureAlertAfter) {
+          try {
+            await sendTelegramMessage(token, {
+              chat_id: chatId,
+              text: `✅ 已恢复正常（此前连续 ${state.failureStreak} 次循环失败）。`,
+              disable_web_page_preview: true,
+            });
+          } catch {
+            // best effort
+          }
+        }
+        if (state.failureStreak) {
+          delete state.failureStreak;
+        }
+      } catch (error) {
+        cycleFailed = true;
+        state.failureStreak = (Number.isFinite(state.failureStreak) ? state.failureStreak : 0) + 1;
+        logInfo(`cycle failed (streak=${state.failureStreak}): ${error.message}`);
+        if (state.failureStreak === failureAlertAfter) {
+          try {
+            await sendTelegramMessage(token, {
+              chat_id: chatId,
+              text: `⚠️ 机器人连续 ${failureAlertAfter} 次循环失败，请检查日志。\n最近错误：${error.message}`,
+              disable_web_page_preview: true,
+            });
+          } catch {
+            // Telegram itself may be down; stay silent
+          }
+        }
+      }
+
+      try {
+        await persistIfDirty();
       } catch (writeError) {
         console.error(`State write failed: ${writeError.message}`);
       }
-    }
+
+      if (Date.now() - lastHeartbeatAt >= HEARTBEAT_MS) {
+        lastHeartbeatAt = Date.now();
+        logInfo(`heartbeat: alive, offset=${state.telegramUpdateOffset ?? "none"}`);
+      }
+
+      if (cycleFailed && !singleCycle) {
+        await sleep(5000);
+      }
+    } while (!singleCycle);
   } finally {
     await releaseRunLock(lockFile);
   }

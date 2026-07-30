@@ -126,17 +126,29 @@ test("writeState round-trips per-window mute state and window notices", async ()
       telegramUpdateOffset: 99,
       mutedWindowKeys: ["2026-07-29|08:30"],
       windowNotices,
+      walkMinutesDefault: 5,
+      walkMinutesByStop: { "17379": 7 },
+      departurePings: { "2026-07-29|08:30": ["17379:189"] },
+      failureStreak: 3,
     });
 
     const reloaded = await readState(stateFile);
     assert.equal(reloaded.telegramUpdateOffset, 99);
     assert.deepEqual(reloaded.mutedWindowKeys, ["2026-07-29|08:30"]);
     assert.deepEqual(reloaded.windowNotices, windowNotices);
+    assert.equal(reloaded.walkMinutesDefault, 5);
+    assert.deepEqual(reloaded.walkMinutesByStop, { "17379": 7 });
+    assert.deepEqual(reloaded.departurePings, { "2026-07-29|08:30": ["17379:189"] });
+    assert.equal(reloaded.failureStreak, 3);
 
     await writeState(stateFile, { alerts: {}, telegramUpdateOffset: 100 });
     const cleared = await readState(stateFile);
     assert.equal(cleared.mutedWindowKeys, undefined);
     assert.equal(cleared.windowNotices, undefined);
+    assert.equal(cleared.walkMinutesDefault, undefined);
+    assert.equal(cleared.walkMinutesByStop, undefined);
+    assert.equal(cleared.departurePings, undefined);
+    assert.equal(cleared.failureStreak, undefined);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

@@ -12,9 +12,13 @@ import {
   buildTelegramButtons,
   getMonitoredServices,
   parseAlertWindows,
+  parseDateKeySet,
   pickBoardedWindow,
+  pickDepartureCandidate,
   releaseRunLock,
+  stopsForPeriod,
   windowKeyFor,
+  windowPeriodKey,
   windowPeriodLabel,
 } from "../lib/runtime-helpers.mjs";
 
@@ -149,4 +153,42 @@ test("windowKeyFor and windowPeriodLabel derive stable identifiers", () => {
   assert.equal(windowKeyFor("2026-07-29", { start: "08:30", end: "09:30" }), "2026-07-29|08:30");
   assert.equal(windowPeriodLabel({ start: "08:30", end: "09:30" }), "晨间");
   assert.equal(windowPeriodLabel({ start: "17:30", end: "18:30" }), "晚间");
+  assert.equal(windowPeriodKey({ start: "08:30", end: "09:30" }), "早");
+  assert.equal(windowPeriodKey({ start: "17:30", end: "18:30" }), "晚");
+});
+
+test("stopsForPeriod filters stops by their configured periods", () => {
+  const stops = [
+    { stop_id: "1", stop_name: "家", services: ["189"] },
+    { stop_id: "2", stop_name: "公司", services: ["963"], periods: ["晚"] },
+    { stop_id: "3", stop_name: "两边", services: ["51"], periods: [] },
+  ];
+
+  assert.deepEqual(
+    stopsForPeriod(stops, "早").map((stop) => stop.stop_id),
+    ["1", "3"],
+  );
+  assert.deepEqual(
+    stopsForPeriod(stops, "晚").map((stop) => stop.stop_id),
+    ["1", "2", "3"],
+  );
+});
+
+test("pickDepartureCandidate fires only inside the leave-now band", () => {
+  const arrival = (minutes) => ({ duration_ms: minutes * 60000, time: "2026-07-30T08:40:00+08:00" });
+
+  assert.equal(pickDepartureCandidate([arrival(10)], 6), null);
+  assert.deepEqual(pickDepartureCandidate([arrival(7)], 6), arrival(7));
+  assert.deepEqual(pickDepartureCandidate([arrival(8)], 6), arrival(8));
+  assert.equal(pickDepartureCandidate([arrival(3), arrival(12)], 6), null);
+  assert.deepEqual(pickDepartureCandidate([arrival(3), arrival(7)], 6), arrival(7));
+  assert.equal(pickDepartureCandidate([null, arrival(20)], 6), null);
+  assert.equal(pickDepartureCandidate([arrival(7)], 0), null);
+  assert.equal(pickDepartureCandidate([], 6), null);
+});
+
+test("parseDateKeySet keeps only well-formed dates", () => {
+  const keys = parseDateKeySet(" 2026-08-10 , 2026-12-25, not-a-date,2026-1-1 ");
+  assert.deepEqual([...keys].sort(), ["2026-08-10", "2026-12-25"]);
+  assert.equal(parseDateKeySet(undefined).size, 0);
 });
