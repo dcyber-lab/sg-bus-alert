@@ -17,6 +17,8 @@ import {
   buildHelpMessage,
   buildTelegramButtons,
   DEFAULT_ACTIVE_WEEKDAYS,
+  describeActiveWeekdays,
+  detectEtaAnomaly,
   normalizeActiveWeekdays,
   parseAlertWindows,
   parseDateKeySet,
@@ -30,6 +32,7 @@ import {
   windowPeriodLabel,
 } from "./lib/runtime-helpers.mjs";
 import {
+  buildLeadLine,
   buildStopSections,
   formatArrivalClock,
   isRainyForecast,
@@ -39,6 +42,7 @@ import {
 import {
   logAlertToHistory as logAlertToHistoryFromStore,
   logBoarding as logBoardingToStore,
+  pruneHistory as pruneHistoryFromStore,
   readBoardingStats as readBoardingStatsFromStore,
   readState as readStateFromStore,
   writeState as writeStateFromStore,
@@ -65,8 +69,10 @@ import {
   buildThresholdServiceMenu,
   buildThresholdValueMenu,
   buildWalkMenu,
+  addDaysToDateKey,
   buildDisplayMenu,
   buildStatsMenu,
+  buildVacationMenu,
   buildWeekdaysMenu,
   buildWindowEditMenu,
   buildWindowsMenu,
@@ -309,8 +315,12 @@ function getMutedWindowKeys(state) {
   return Array.isArray(state.mutedWindowKeys) ? state.mutedWindowKeys : [];
 }
 
+function isOnVacation(state, dateKey) {
+  return Boolean(state.vacationUntil && state.vacationUntil >= dateKey);
+}
+
 function isDayMuted(state, dateKey) {
-  return state.mutedUntilDateKey === dateKey;
+  return state.mutedUntilDateKey === dateKey || isOnVacation(state, dateKey);
 }
 
 function addMutedWindowKey(state, key) {
@@ -353,6 +363,9 @@ function isProactiveMutedNow(state, timeZone, windows) {
 }
 
 function describeMuteStatus(state, todayKey, windows) {
+  if (isOnVacation(state, todayKey)) {
+    return `🏖 休假中（到 ${state.vacationUntil}），主动提醒已停`;
+  }
   if (isDayMuted(state, todayKey)) {
     return "🔕 主动提醒：今天已全部暂停";
   }
@@ -936,9 +949,14 @@ function buildWindowNoticeMessage(
   periodLabel,
   hasTriggered,
   footerLine,
-  { displayMode = "auto", rainy = false } = {},
+  { displayMode = "auto", rainy = false, leadLine = null } = {},
 ) {
-  const lines = [`⏰ ${periodLabel}出行提醒`, ""];
+  const lines = [];
+
+  if (leadLine) {
+    lines.push(leadLine);
+  }
+  lines.push(`⏰ ${periodLabel}出行提醒`, "");
 
   if (rainy) {
     lines.push("☔ 有雨，记得带伞（已提前提醒）");
@@ -998,8 +1016,10 @@ function applyMuteBannerToMessageText(text, bannerLine) {
     filtered.push(lines[index]);
   }
 
-  if (bannerLine && filtered.length >= 2 && MUTE_BANNER_HEADERS.has(filtered[0]) && filtered[1] === "") {
-    filtered.splice(2, 0, bannerLine, "");
+  // Window notices lead with an ETA summary, so the header may be the second line.
+  const headerIndex = filtered.findIndex((line) => MUTE_BANNER_HEADERS.has(line));
+  if (bannerLine && headerIndex !== -1 && filtered[headerIndex + 1] === "") {
+    filtered.splice(headerIndex + 2, 0, bannerLine, "");
   }
 
   return filtered.join("\n");
@@ -1027,6 +1047,10 @@ function cleanupState(state, nowIso, timeZone) {
 
   if (state.mutedUntilDateKey && state.mutedUntilDateKey < todayKey) {
     delete state.mutedUntilDateKey;
+  }
+
+  if (state.vacationUntil && state.vacationUntil < todayKey) {
+    delete state.vacationUntil;
   }
 
   const mutedToday = getMutedWindowKeys(state).filter((key) => key.startsWith(`${todayKey}|`));
@@ -1116,6 +1140,57 @@ async function discoverServiceCandidateStops(apiBase, stops, serviceNo, runCache
   }
 
   return candidates;
+}
+
+// Compares each service's leading bus against where it should be by now and
+// reports the ones that quietly slipped or disappeared before arriving.
+function collectEtaAnomalies(context, items, windowKey) {
+  const tracker = context.etaTracker;
+  const nowMs = Date.now();
+  const anomalies = [];
+
+  for (const item of items) {
+    const key = `${item.stop.stop_id}:${item.serviceNo}`;
+    const leading = (item.arrivals || []).find(
+      (arrival) => arrival && typeof arrival.duration_ms === "number",
+    );
+    const currentDurationMs = leading ? leading.duration_ms : null;
+    const previous = tracker.get(key);
+    const alertKey = `${windowKey}|${key}`;
+
+    if (!context.reportedAnomalies.has(alertKey)) {
+      const anomaly = detectEtaAnomaly(previous, currentDurationMs, nowMs);
+      if (anomaly) {
+        context.reportedAnomalies.add(alertKey);
+        anomalies.push({ ...anomaly, stop: item.stop, serviceNo: item.serviceNo });
+      }
+    }
+
+    if (currentDurationMs === null) {
+      tracker.delete(key);
+    } else {
+      tracker.set(key, { durationMs: currentDurationMs, at: nowMs });
+    }
+  }
+
+  return anomalies;
+}
+
+function buildAnomalyMessage(anomalies) {
+  const lines = ["⚠️ 有车没了", ""];
+
+  for (const anomaly of anomalies) {
+    lines.push(`🚌 ${anomaly.serviceNo}｜📍 ${anomaly.stop.stop_name}`);
+    lines.push(
+      anomaly.kind === "vanished"
+        ? `   原本还有 ${anomaly.expectedMinutes} 分钟到，现在从班次里消失了`
+        : `   原本还有 ${anomaly.expectedMinutes} 分钟，现在要等 ${anomaly.actualMinutes} 分钟`,
+    );
+  }
+
+  lines.push("");
+  lines.push("别白等了，看看其他线路或改走地铁。");
+  return lines.join("\n");
 }
 
 async function evaluateWindowServices(apiBase, stops, state, defaultThresholdMinutes, runCache) {
@@ -1258,6 +1333,20 @@ async function proactiveTick(context, now) {
   const displayMode = state.displayMode || "auto";
   const existingNotice = notices[windowKey];
 
+  // Only worth interrupting once the user has been told a bus is coming.
+  const anomalies = existingNotice ? collectEtaAnomalies(context, items, windowKey) : [];
+  if (anomalies.length > 0) {
+    await sendTelegramMessage(token, {
+      chat_id: chatId,
+      text: buildAnomalyMessage(anomalies),
+      disable_web_page_preview: true,
+      reply_markup: buildTelegramButtons(stops, false),
+    });
+    for (const anomaly of anomalies) {
+      logInfo(`eta anomaly (${anomaly.kind}) for ${anomaly.stop.stop_id}:${anomaly.serviceNo}`);
+    }
+  }
+
   if (!existingNotice) {
     if (triggered.length > 0 && items.length > 0) {
       const text = buildWindowNoticeMessage(
@@ -1267,7 +1356,7 @@ async function proactiveTick(context, now) {
         periodLabel,
         true,
         `🔄 自动刷新中｜更新时间：${nowClock}`,
-        { displayMode, rainy },
+        { displayMode, rainy, leadLine: buildLeadLine(items, nowClock) },
       );
       const sent = await sendTelegramMessage(token, {
         chat_id: chatId,
@@ -1300,7 +1389,7 @@ async function proactiveTick(context, now) {
       periodLabel,
       triggered.length > 0,
       `🔄 自动刷新中｜更新时间：${nowClock}`,
-      { displayMode, rainy },
+      { displayMode, rainy, leadLine: buildLeadLine(items, nowClock) },
     );
 
     if (text !== existingNotice.lastText && existingNotice.messageId) {
@@ -1744,6 +1833,27 @@ async function handleMenuCallback(context, message, callbackQuery, parsed) {
       notice = `${updated.start}-${updated.end}`;
       logInfo(`alert window ${index} set to ${updated.start}-${updated.end}`);
       await showMenuScreen(context, message, buildWindowTimeMenu(index, updated, field));
+      break;
+    }
+
+    case "vac": {
+      const todayKey = formatDateKey(new Date(), timeZone);
+      await showMenuScreen(context, message, buildVacationMenu(state.vacationUntil, todayKey));
+      break;
+    }
+
+    case "vacset": {
+      const days = Number(args[0]);
+      const todayKey = formatDateKey(new Date(), timeZone);
+      if (days > 0) {
+        state.vacationUntil = addDaysToDateKey(todayKey, days);
+        notice = `休假到 ${state.vacationUntil}`;
+      } else {
+        delete state.vacationUntil;
+        notice = "休假已结束";
+      }
+      logInfo(`vacation until ${state.vacationUntil || "none"}`);
+      await showMenuScreen(context, message, buildVacationMenu(state.vacationUntil, todayKey));
       break;
     }
 
@@ -2628,6 +2738,11 @@ async function main() {
   for (const key of DEFAULT_SG_PUBLIC_HOLIDAYS) {
     holidays.add(key);
   }
+  const parsedHistoryKeepDays = Number(env.HISTORY_KEEP_DAYS);
+  const historyKeepDays =
+    Number.isFinite(parsedHistoryKeepDays) && parsedHistoryKeepDays > 0
+      ? parsedHistoryKeepDays
+      : 180;
   const parsedRainExtra = Number(env.RAIN_EXTRA_MINUTES);
   const rainExtraMinutes =
     Number.isFinite(parsedRainExtra) && parsedRainExtra >= 0 ? parsedRainExtra : 3;
@@ -2699,6 +2814,8 @@ async function main() {
       weatherCache: { summary: null, fetchedAt: 0, lastAttemptAt: 0 },
       holidayLoggedFor: null,
       lastWindowLog: null,
+      etaTracker: new Map(),
+      reportedAnomalies: new Set(),
     };
     context.getWeatherSummary = () => getWeatherSummaryCached(context, weatherConfig, nowcastArea);
 
@@ -2738,6 +2855,11 @@ async function main() {
       await writeConfigBackup(stateFile, state);
     } catch (error) {
       logInfo(`config backup failed: ${describeError(error)}`);
+    }
+
+    const prunedRows = await pruneHistoryFromStore(stateFile, historyKeepDays);
+    if (prunedRows > 0) {
+      logInfo(`pruned ${prunedRows} history rows older than ${historyKeepDays} days`);
     }
 
     do {

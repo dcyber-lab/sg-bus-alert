@@ -16,6 +16,11 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
   - weather summary (Open-Meteo daily + data.gov.sg 2-hour nowcast)
   - the next 3 buses for every monitored service in that window
   - current ETA, load, vehicle type, and arrival clock time
+- The window notice leads with an ETA summary line (`🚌 963 3 分钟｜189 8 分钟（08:37）`) rather than a title, because that first line is all a phone notification banner and the chat-list preview ever show. The clock stamp makes a stale banner obvious — edits never re-notify.
+- Ghost-bus detection: each service's leading bus is compared against where it should be by now, and a *separate* message (so it does notify) is sent when a bus vanishes before it could have arrived, or its wait jumps by 4+ minutes. A bus counting down to arrival is not reported.
+- Crowded first bus and probable last bus of the day are flagged inline.
+- 🏖 休假模式 mutes proactive alerts for a date range; manual queries still work.
+- Alert history older than `HISTORY_KEEP_DAYS` (default 180) is pruned and the DB vacuumed at startup.
 - A stop with 3+ monitored routes switches to a compact layout: one time-sorted list of the soonest buses across all its routes (a 4-route stop goes from ~77 lines to ~7). Forceable either way from 🖥 显示方式.
 - When the nowcast says rain, the alert threshold widens by `RAIN_EXTRA_MINUTES` (default 3) and the message carries an umbrella reminder.
 - Pressing 🛑 我上车了 is recorded in `boarding_log`; 📊 我的统计 reports the average, earliest and latest boarding time per window and suggests a better window once there are 5+ records.
@@ -121,6 +126,7 @@ Configuration is done by tapping buttons, not by typing commands. `⚙️ 设置
           ├─ 📅 生效星期  → toggle each weekday
           ├─ 📊 我的统计  → boarding habits per window + window suggestion
           ├─ 🖥 显示方式  → 自动 / 总是紧凑 / 总是详细
+          ├─ 🏖 休假模式  → 今天 / 3 天 / 1 周 / 2 周 / 结束
           └─ ❌ 关闭
 ```
 
@@ -383,6 +389,8 @@ Current config keys:
   - consecutive failed cycles before the self-diagnosis warning, default `30`
 - `RAIN_EXTRA_MINUTES`
   - extra alert threshold when the nowcast says rain, default `3`
+- `HISTORY_KEEP_DAYS`
+  - how long `alert_history` is kept before startup pruning, default `180`
 - `STATE_FILE`
   - legacy JSON migration source path; corresponding `.db` path is used as the primary runtime store
 - `STOP_CONFIG_JSON`

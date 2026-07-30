@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   buildCompactStopSection,
   buildDetailedStopSection,
+  buildLeadLine,
+  buildServiceHints,
   buildStopSections,
   collectSoonestArrivals,
   findServicesWithoutData,
@@ -145,6 +147,41 @@ test("minutesLabel reads naturally at the boundaries", () => {
   assert.equal(minutesLabel(20000), "1 分钟");
   assert.equal(minutesLabel(60000), "1 分钟");
   assert.equal(minutesLabel(5 * 60000), "5 分钟");
+});
+
+test("buildLeadLine puts the soonest ETAs where a notification banner shows them", () => {
+  const items = [
+    { serviceNo: "189", arrivals: [arrival(8)] },
+    { serviceNo: "963", arrivals: [arrival(3)] },
+    { serviceNo: "97", arrivals: [arrival(15)] },
+    { serviceNo: "166", arrivals: [arrival(20)] },
+  ];
+
+  assert.equal(buildLeadLine(items, "08:37"), "🚌 963 3 分钟｜189 8 分钟｜97 15 分钟（08:37）");
+  assert.equal(buildLeadLine(items, null, 1), "🚌 963 3 分钟");
+});
+
+test("buildLeadLine skips routes without timings and yields nothing when all are empty", () => {
+  assert.equal(
+    buildLeadLine([{ serviceNo: "189", arrivals: [] }, { serviceNo: "963", arrivals: [arrival(4)] }], "08:37"),
+    "🚌 963 4 分钟（08:37）",
+  );
+  assert.equal(buildLeadLine([{ serviceNo: "189", arrivals: [null] }], "08:37"), null);
+  assert.equal(buildLeadLine([], "08:37"), null);
+});
+
+test("buildServiceHints warns about a crowded first bus and a likely last bus", () => {
+  assert.deepEqual(
+    buildServiceHints([{ serviceNo: "189", arrivals: [arrival(4, "LSD"), arrival(12)] }]),
+    ["😤 189 首班较拥挤，下一班 12 分钟"],
+  );
+
+  assert.deepEqual(buildServiceHints([{ serviceNo: "963", arrivals: [arrival(9)] }]), [
+    "🌙 963 后面没有班次了，可能是末班车",
+  ]);
+
+  assert.deepEqual(buildServiceHints([{ serviceNo: "97", arrivals: [arrival(5), arrival(15)] }]), []);
+  assert.deepEqual(buildServiceHints([{ serviceNo: "97", arrivals: [] }]), []);
 });
 
 test("isRainyForecast catches the wet nowcast wordings", () => {

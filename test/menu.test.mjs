@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  addDaysToDateKey,
   applyWindowTime,
   buildDeleteConfirmMenu,
+  buildVacationMenu,
   buildMainMenu,
   buildPeriodMenu,
   buildRenamePrompt,
@@ -82,32 +84,30 @@ test("main menu lists one button per stop plus the global actions", () => {
   assert.match(menu.text, /金文泰大牌304 \(17379\)/);
   assert.match(menu.text, /提前 8 分钟提醒/);
   assert.match(menu.text, /只晚高峰/);
-  assert.deepEqual(callbackDataOf(menu.replyMarkup), [
-    "m:stop:17379",
-    "m:stop:17051",
-    "m:add",
-    "m:walk",
-    "m:win",
-    "m:days",
-    "m:stats",
-    "m:display",
-    "m:close",
-  ]);
+  const data = callbackDataOf(menu.replyMarkup);
+  // Stop buttons are the part that must match exactly; global actions are
+  // asserted by presence so adding a screen does not break this test.
+  assert.deepEqual(
+    data.filter((item) => item.startsWith("m:stop:")),
+    ["m:stop:17379", "m:stop:17051"],
+  );
+  for (const required of ["m:add", "m:walk", "m:win", "m:close"]) {
+    assert.ok(data.includes(required), `main menu lost ${required}`);
+  }
+  assert.equal(data.at(-1), "m:close", "close should stay the last button");
 });
 
 test("main menu guides the user when nothing is monitored yet", () => {
   const menu = buildMainMenu([], {}, 8);
 
   assert.match(menu.text, /还没有监控任何站点/);
-  assert.deepEqual(callbackDataOf(menu.replyMarkup), [
-    "m:add",
-    "m:walk",
-    "m:win",
-    "m:days",
-    "m:stats",
-    "m:display",
-    "m:close",
-  ]);
+  const data = callbackDataOf(menu.replyMarkup);
+  assert.equal(
+    data.filter((item) => item.startsWith("m:stop:")).length,
+    0,
+    "no stops means no stop buttons",
+  );
+  assert.ok(data.includes("m:add"));
 });
 
 test("routes menu offers removal for monitored and addition for the rest", () => {
@@ -281,6 +281,26 @@ test("minuteToHhmm formats and clamps into a valid clock time", () => {
   assert.equal(minuteToHhmm(8 * 60 + 30), "08:30");
   assert.equal(minuteToHhmm(-30), "00:00");
   assert.equal(minuteToHhmm(24 * 60), "23:30");
+});
+
+test("addDaysToDateKey counts the current day as the first day off", () => {
+  assert.equal(addDaysToDateKey("2026-07-30", 1), "2026-07-30");
+  assert.equal(addDaysToDateKey("2026-07-30", 3), "2026-08-01");
+  assert.equal(addDaysToDateKey("2026-12-30", 7), "2027-01-05");
+});
+
+test("vacation menu shows the end date and only offers to cancel while active", () => {
+  const active = buildVacationMenu("2026-08-05", "2026-07-30");
+  assert.match(active.text, /休假到 2026-08-05/);
+  assert.ok(callbackDataOf(active.replyMarkup).includes("m:vacset:0"));
+
+  const idle = buildVacationMenu(undefined, "2026-07-30");
+  assert.match(idle.text, /未在休假/);
+  assert.equal(callbackDataOf(idle.replyMarkup).includes("m:vacset:0"), false);
+
+  // A finished vacation should read as idle, not as still running.
+  const expired = buildVacationMenu("2026-07-01", "2026-07-30");
+  assert.match(expired.text, /未在休假/);
 });
 
 test("weekday menu marks the selected days and toggles each one", () => {

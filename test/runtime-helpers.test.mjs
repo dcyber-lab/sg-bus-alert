@@ -10,6 +10,7 @@ import {
   buildAvailableCommandsHint,
   buildLockContents,
   buildTelegramButtons,
+  detectEtaAnomaly,
   getMonitoredServices,
   parseAlertWindows,
   parseDateKeySet,
@@ -188,6 +189,47 @@ test("pickDepartureCandidate fires only inside the leave-now band", () => {
   assert.equal(pickDepartureCandidate([null, arrival(20)], 6), null);
   assert.equal(pickDepartureCandidate([arrival(7)], 0), null);
   assert.equal(pickDepartureCandidate([], 6), null);
+});
+
+test("detectEtaAnomaly reports a bus that vanished before it could arrive", () => {
+  const start = 1_000_000;
+  // Was 5 minutes out; 30s later it is gone from the feed entirely.
+  const anomaly = detectEtaAnomaly({ durationMs: 5 * 60000, at: start }, null, start + 30_000);
+
+  assert.equal(anomaly.kind, "vanished");
+  assert.equal(anomaly.expectedMinutes, 5);
+  assert.equal(anomaly.actualMinutes, null);
+});
+
+test("detectEtaAnomaly reports a large unexplained jump in waiting time", () => {
+  const start = 1_000_000;
+  const anomaly = detectEtaAnomaly(
+    { durationMs: 4 * 60000, at: start },
+    15 * 60000,
+    start + 30_000,
+  );
+
+  assert.equal(anomaly.kind, "delayed");
+  assert.equal(anomaly.actualMinutes, 15);
+});
+
+test("detectEtaAnomaly stays quiet when a bus simply arrived", () => {
+  const start = 1_000_000;
+
+  // Down to 40s, then replaced by the following bus: that is a normal arrival.
+  assert.equal(detectEtaAnomaly({ durationMs: 40_000, at: start }, 12 * 60000, start + 10_000), null);
+  assert.equal(detectEtaAnomaly({ durationMs: 40_000, at: start }, null, start + 10_000), null);
+});
+
+test("detectEtaAnomaly tolerates normal ETA jitter and missing history", () => {
+  const start = 1_000_000;
+
+  // Counting down as expected, plus a minute of ordinary drift.
+  assert.equal(detectEtaAnomaly({ durationMs: 8 * 60000, at: start }, 7 * 60000, start + 60_000), null);
+  assert.equal(detectEtaAnomaly({ durationMs: 8 * 60000, at: start }, 8 * 60000, start + 60_000), null);
+
+  assert.equal(detectEtaAnomaly(null, 5 * 60000, start), null);
+  assert.equal(detectEtaAnomaly({ durationMs: 5 * 60000, at: start }, null, start - 5_000), null);
 });
 
 test("parseDateKeySet keeps only well-formed dates", () => {
