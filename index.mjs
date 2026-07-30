@@ -32,6 +32,16 @@ import {
   readState as readStateFromStore,
   writeState as writeStateFromStore,
 } from "./lib/state-store.mjs";
+import {
+  extractCoordinate,
+  findNearestStops,
+  findUrl,
+  formatDistance,
+  isPlausibleSingaporeCoordinate,
+  isResolvableShortLink,
+  looksLikeLocationInput,
+  parseStopsDataset,
+} from "./lib/location.mjs";
 
 const ENV_PATH = path.join(process.cwd(), ".env");
 const execFileAsync = promisify(execFile);
@@ -40,6 +50,11 @@ const WEATHER_TTL_MS = 10 * 60 * 1000;
 const WEATHER_RETRY_MS = 60 * 1000;
 const PROACTIVE_TICK_MS = 9 * 1000;
 const HEARTBEAT_MS = 60 * 60 * 1000;
+const STOPS_DATASET_URL = "https://data.busrouter.sg/v1/stops.min.json";
+const STOPS_CACHE_FILE = "stops-cache.json";
+const STOPS_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const NEARBY_STOP_LIMIT = 5;
+const NEARBY_RADIUS_METERS = 800;
 
 // MOM-announced Singapore public holidays; refresh once a year, extend via PUBLIC_HOLIDAYS env.
 const DEFAULT_SG_PUBLIC_HOLIDAYS = [
@@ -467,6 +482,131 @@ async function fetchArrivalsCached(apiBase, stopId, runCache) {
   return runCache.arrivals.get(stopId);
 }
 
+async function loadStopsDataset(context) {
+  if (context.stopsDataset) {
+    return context.stopsDataset;
+  }
+
+  const cachePath = path.join(path.dirname(context.stateFile), STOPS_CACHE_FILE);
+  try {
+    const cached = JSON.parse(await fs.readFile(cachePath, "utf8"));
+    if (cached?.fetchedAt && Date.now() - cached.fetchedAt < STOPS_CACHE_TTL_MS) {
+      context.stopsDataset = parseStopsDataset(cached.stops);
+      return context.stopsDataset;
+    }
+  } catch {
+    // no usable cache; fall through to a fresh download
+  }
+
+  const json = await fetchJson(STOPS_DATASET_URL);
+  context.stopsDataset = parseStopsDataset(json);
+  try {
+    await fs.writeFile(cachePath, JSON.stringify({ fetchedAt: Date.now(), stops: json }), "utf8");
+  } catch (error) {
+    logInfo(`stops cache write failed: ${error.message}`);
+  }
+  logInfo(`stops dataset loaded (${context.stopsDataset.length} stops)`);
+  return context.stopsDataset;
+}
+
+// Only ever follows Google's own short-link hosts, so a pasted link cannot be
+// used to make the bot fetch an arbitrary address.
+async function resolveShortLink(url) {
+  let current = url;
+
+  for (let hop = 0; hop < 5; hop += 1) {
+    if (!isResolvableShortLink(current)) {
+      return null;
+    }
+
+    const response = await fetch(current, {
+      redirect: "manual",
+      headers: { "user-agent": "Mozilla/5.0 (compatible; sg-bus-alert/1.0)" },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+
+    const location = response.headers.get("location");
+    if (location) {
+      current = new URL(location, current).toString();
+      const fromUrl = extractCoordinate(current);
+      if (fromUrl) {
+        return fromUrl;
+      }
+      continue;
+    }
+
+    if (response.ok) {
+      const body = await response.text();
+      return extractCoordinate(body);
+    }
+
+    return null;
+  }
+
+  return null;
+}
+
+async function resolveCoordinateFromText(text) {
+  const direct = extractCoordinate(text);
+  if (direct) {
+    return direct;
+  }
+
+  const url = findUrl(text);
+  if (url && isResolvableShortLink(url)) {
+    return resolveShortLink(url);
+  }
+
+  return null;
+}
+
+function buildNearbyStopsMessage(candidates, monitoredStops) {
+  const lines = ["📍 附近的公交站", ""];
+
+  candidates.forEach((candidate, index) => {
+    const already = monitoredStops.some((stop) => stop.stop_id === candidate.stop_id);
+    lines.push(
+      `${index + 1}. ${candidate.name}${candidate.road ? `（${candidate.road}）` : ""}`,
+    );
+    lines.push(
+      `   ${candidate.stop_id}｜${formatDistance(candidate.distanceMeters)}${already ? "｜已在监控中" : ""}`,
+    );
+  });
+
+  lines.push("");
+  lines.push("点下面的按钮把站点加入监控，加完会列出该站的线路。");
+  return lines.join("\n");
+}
+
+function buildNearbyStopsKeyboard(candidates, monitoredStops) {
+  const rows = candidates
+    .filter((candidate) => !monitoredStops.some((stop) => stop.stop_id === candidate.stop_id))
+    .map((candidate) => [
+      {
+        text: `➕ ${candidate.name} · ${formatDistance(candidate.distanceMeters)}`,
+        callback_data: `addstop:${candidate.stop_id}`,
+      },
+    ]);
+
+  return rows.length > 0 ? { inline_keyboard: rows } : null;
+}
+
+function buildStopServicesKeyboard(stopId, serviceNumbers, monitoredServices) {
+  const rows = [];
+  const pending = serviceNumbers.filter((serviceNo) => !monitoredServices.includes(serviceNo));
+
+  for (let index = 0; index < pending.length; index += 3) {
+    rows.push(
+      pending.slice(index, index + 3).map((serviceNo) => ({
+        text: `➕ ${serviceNo}`,
+        callback_data: `addsvc:${stopId}:${serviceNo}`,
+      })),
+    );
+  }
+
+  return rows.length > 0 ? { inline_keyboard: rows } : null;
+}
+
 async function fetchNowcastLine(area) {
   const json = await fetchJson("https://api-open.data.gov.sg/v2/real-time/api/two-hr-forecast");
   const forecasts = json?.data?.items?.[0]?.forecasts || [];
@@ -752,6 +892,9 @@ function buildConfigMessage(stops, state, defaultThresholdMinutes) {
   lines.push("阈值 <线路号> <分钟>");
   lines.push("步行 <分钟> / 步行 <站点ID> <分钟> / 步行 关");
   lines.push("设置时段 <站点ID> 早|晚|全部");
+  lines.push("重命名 <站点ID> <名称>");
+  lines.push("");
+  lines.push("加新站点：直接发位置或粘贴 Google 地图链接");
   return lines.join("\n");
 }
 
@@ -1198,6 +1341,135 @@ async function proactiveTick(context, now) {
   }
 }
 
+async function handleSharedLocation(context, message, coordinate) {
+  const { token, chatId, state, stops, timeZone, alertWindows } = context;
+  const replyMarkup = buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows));
+
+  if (!isPlausibleSingaporeCoordinate(coordinate)) {
+    await sendTelegramMessage(token, {
+      chat_id: chatId,
+      text: "这个位置看起来不在新加坡，请确认后再发一次。",
+      reply_to_message_id: message.message_id,
+      disable_web_page_preview: true,
+      reply_markup: replyMarkup,
+    });
+    return;
+  }
+
+  let dataset = null;
+  try {
+    dataset = await loadStopsDataset(context);
+  } catch (error) {
+    logInfo(`stops dataset load failed: ${describeError(error)}`);
+    await sendTelegramMessage(token, {
+      chat_id: chatId,
+      text: "暂时拿不到站点数据，请稍后再试一次。",
+      reply_to_message_id: message.message_id,
+      disable_web_page_preview: true,
+      reply_markup: replyMarkup,
+    });
+    return;
+  }
+
+  const candidates = findNearestStops(dataset, coordinate, {
+    limit: NEARBY_STOP_LIMIT,
+    maxMeters: NEARBY_RADIUS_METERS,
+  });
+
+  if (candidates.length === 0) {
+    await sendTelegramMessage(token, {
+      chat_id: chatId,
+      text: `这个位置 ${NEARBY_RADIUS_METERS} 米内没有找到公交站。\n可以把地图上的图钉挪到路边的车站再发一次。`,
+      reply_to_message_id: message.message_id,
+      disable_web_page_preview: true,
+      reply_markup: replyMarkup,
+    });
+    return;
+  }
+
+  await sendTelegramMessage(token, {
+    chat_id: chatId,
+    text: buildNearbyStopsMessage(candidates, stops),
+    reply_to_message_id: message.message_id,
+    disable_web_page_preview: true,
+    reply_markup: buildNearbyStopsKeyboard(candidates, stops) || replyMarkup,
+  });
+  logInfo(`nearby stops offered for ${coordinate.lat},${coordinate.lng}`);
+}
+
+async function handleAddStopCallback(context, message, callbackQuery, stopId) {
+  const { token, chatId, state, stops, apiBase, runCache } = context;
+
+  if (stops.some((stop) => stop.stop_id === stopId)) {
+    await answerTelegramCallbackQuery(token, callbackQuery.id, "该站点已在监控中");
+    return;
+  }
+
+  let dataset = [];
+  try {
+    dataset = await loadStopsDataset(context);
+  } catch {
+    dataset = [];
+  }
+  const known = dataset.find((stop) => stop.stop_id === stopId);
+  const newStop = { stop_id: stopId, stop_name: known?.name || stopId, services: [] };
+  stops.push(newStop);
+  state.monitoredStops = cloneStops(stops);
+
+  let serviceNumbers = [];
+  try {
+    const arrivalData = await fetchArrivalsCached(apiBase, stopId, runCache);
+    serviceNumbers = (arrivalData.services || []).map((service) => service.no).sort();
+  } catch (error) {
+    logInfo(`service discovery failed for ${stopId}: ${describeError(error)}`);
+  }
+
+  const lines = [`✅ 已添加站点：${newStop.stop_name} (${stopId})`, ""];
+  if (serviceNumbers.length > 0) {
+    lines.push(`这个站现在经过的线路：${serviceNumbers.join(" / ")}`);
+    lines.push("");
+    lines.push("点按钮选择要监控的线路。");
+  } else {
+    lines.push("暂时没查到该站的线路，可以稍后发送：添加线路 <线路号> " + stopId);
+  }
+  lines.push("");
+  lines.push(`改成中文名：重命名 ${stopId} 公司门口`);
+  lines.push(`只在某个时段提醒：设置时段 ${stopId} 晚`);
+
+  await sendTelegramMessage(token, {
+    chat_id: chatId,
+    text: lines.join("\n"),
+    disable_web_page_preview: true,
+    reply_markup: buildStopServicesKeyboard(stopId, serviceNumbers, []) || undefined,
+  });
+  await answerTelegramCallbackQuery(token, callbackQuery.id, "站点已添加");
+  logInfo(`stop ${stopId} added from shared location`);
+}
+
+async function handleAddServiceCallback(context, message, callbackQuery, stopId, serviceNo) {
+  const { token, chatId, state, stops, timeZone, alertWindows } = context;
+  const targetStop = stops.find((stop) => stop.stop_id === stopId);
+
+  if (!targetStop) {
+    await answerTelegramCallbackQuery(token, callbackQuery.id, "站点已不在监控中");
+    return;
+  }
+
+  if (!(targetStop.services || []).includes(serviceNo)) {
+    targetStop.services = Array.from(new Set([...(targetStop.services || []), serviceNo])).sort();
+    state.monitoredStops = cloneStops(stops);
+    logInfo(`service ${serviceNo} added to stop ${stopId}`);
+  }
+
+  await sendTelegramMessage(token, {
+    chat_id: chatId,
+    text: `✅ 已监控 ${serviceNo}\n站点：${targetStop.stop_name} (${stopId})`,
+    disable_web_page_preview: true,
+    reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
+  });
+  await answerTelegramCallbackQuery(token, callbackQuery.id, `已添加 ${serviceNo}`);
+}
+
 async function processTelegramCommands(context, pollSeconds) {
   const {
     token,
@@ -1223,9 +1495,29 @@ async function processTelegramCommands(context, pollSeconds) {
       continue;
     }
 
+    const sharedLocation = update.message?.location || update.message?.venue?.location;
+    if (!callbackQuery && sharedLocation) {
+      await handleSharedLocation(context, message, {
+        lat: sharedLocation.latitude,
+        lng: sharedLocation.longitude,
+      });
+      continue;
+    }
+
     let text = (message.text || "").trim();
     if (callbackQuery) {
-      switch (callbackQuery.data) {
+      const data = String(callbackQuery.data || "");
+      if (data.startsWith("addstop:")) {
+        await handleAddStopCallback(context, message, callbackQuery, data.slice("addstop:".length));
+        continue;
+      }
+      if (data.startsWith("addsvc:")) {
+        const [, stopId, serviceNo] = data.split(":");
+        await handleAddServiceCallback(context, message, callbackQuery, stopId, serviceNo);
+        continue;
+      }
+
+      switch (data) {
         case "status_all":
           text = "状态";
           break;
@@ -1239,7 +1531,7 @@ async function processTelegramCommands(context, pollSeconds) {
           text = "恢复";
           break;
         default:
-          text = parseServiceCallbackData(callbackQuery.data) || "";
+          text = parseServiceCallbackData(data) || "";
       }
     }
     if (!text) {
@@ -1700,6 +1992,71 @@ async function processTelegramCommands(context, pollSeconds) {
       await sendTelegramMessage(token, {
         chat_id: chatId,
         text: replyText,
+        reply_to_message_id: message.message_id,
+        disable_web_page_preview: true,
+        reply_markup: replyMarkup,
+      });
+      continue;
+    } else if (!callbackQuery && looksLikeLocationInput(text)) {
+      let coordinate = null;
+      try {
+        coordinate = await resolveCoordinateFromText(text);
+      } catch (error) {
+        logInfo(`map link resolution failed: ${describeError(error)}`);
+      }
+
+      if (!coordinate) {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: [
+            "没能从这个链接里读出坐标。",
+            "",
+            "最稳的方式：用 Telegram 的 📎 附件 → 位置（Location），把图钉拖到车站再发送。",
+            "也可以在 Google 地图里长按目标点，把最下方显示的一串坐标（例如 1.32049,103.76389）直接发给我。",
+          ].join("\n"),
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
+        });
+        continue;
+      }
+
+      await handleSharedLocation(context, message, coordinate);
+      continue;
+    } else if (/^重命名\s+\S+\s+.+/.test(text)) {
+      const match = /^重命名\s+(\S+)\s+(.+)$/.exec(text);
+      const renameStop = findStopByIdentifier(stops, match[1]);
+      const newName = match[2].trim();
+      const replyMarkup = buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows));
+
+      if (!renameStop) {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: "没有找到你指定的站点，可用站点请先发送：配置",
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: replyMarkup,
+        });
+        continue;
+      }
+
+      if (!isValidStopName(newName)) {
+        await sendTelegramMessage(token, {
+          chat_id: chatId,
+          text: "名称无效，请控制在 80 字以内且不要换行。",
+          reply_to_message_id: message.message_id,
+          disable_web_page_preview: true,
+          reply_markup: replyMarkup,
+        });
+        continue;
+      }
+
+      const previousName = renameStop.stop_name;
+      renameStop.stop_name = newName;
+      state.monitoredStops = cloneStops(stops);
+      await sendTelegramMessage(token, {
+        chat_id: chatId,
+        text: `✅ 已重命名：${previousName} → ${newName} (${renameStop.stop_id})`,
         reply_to_message_id: message.message_id,
         disable_web_page_preview: true,
         reply_markup: replyMarkup,

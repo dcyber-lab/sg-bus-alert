@@ -12,7 +12,8 @@ This is a small local automation project for Singapore bus alerts on Telegram.
 - Weekday alert windows: `08:30-09:30` and `17:30-18:30` (Asia/Singapore); Singapore public holidays skipped
 - One proactive message per window, then silent in-place edits (~10s) — no repeated pushes
 - Optional walk-time departure pings (`步行 <分钟>`): max one "leave now" push per service per window
-- Stops can be limited to 早/晚 windows via `设置时段`
+- Stops can be limited to 早/晚 windows via `设置时段`, renamed via `重命名`
+- Adding a stop: share a Telegram location, paste a Google Maps link, or send `lat,lng`; the bot lists stops within 800m as buttons, then lists that stop's services as buttons
 - Weather: Open-Meteo daily + data.gov.sg 2h nowcast, cached 10 min, best-effort
 - Mute: `上车了` = current window only; `暂停` = whole day; `恢复` clears both
 
@@ -20,7 +21,8 @@ This is a small local automation project for Singapore bus alerts on Telegram.
 
 - Long-lived daemon (`systemd --user` service, `Restart=always`), Telegram long polling: 20s idle, 5s during windows; the old 10s timer is gone
 - `index.mjs`: all runtime logic (daemon loop `main` + `proactiveTick` + command handling)
-- `lib/runtime-helpers.mjs` + `lib/state-store.mjs`: tested helpers and SQLite state store
+- `lib/runtime-helpers.mjs` + `lib/state-store.mjs` + `lib/location.mjs`: tested helpers, SQLite state store, map-link/coordinate parsing
+- Stop coordinates from data.busrouter.sg, cached in `stops-cache.json` (30-day TTL, gitignored)
 - `.env`: local config, read once at startup — restart service after edits
 - `state.db`: SQLite state, persisted only when dirty
 - Lock file makes a second instance exit cleanly (never double-poll `getUpdates`)
@@ -39,5 +41,6 @@ This is a small local automation project for Singapore bus alerts on Telegram.
 - Do not break `windowNotices` / `departurePings` tracking — they prevent duplicate pushes
 - Never run two pollers at once — Telegram `getUpdates` conflicts (409)
 - Keep `dns.setDefaultResultOrder("ipv4first")`: Telegram's IPv6 address is unreachable on this network and Node's fetch will not fall back on its own
+- Short-link resolution must stay restricted to Google hosts (`isResolvableShortLink`) and use manual redirects — a pasted link must never make the bot fetch an arbitrary address
 - Weather failures should not break bus replies
 - `DEFAULT_SG_PUBLIC_HOLIDAYS` in `index.mjs` needs a yearly refresh

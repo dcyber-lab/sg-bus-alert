@@ -12,3 +12,4 @@ state.json
 *.db.bak
 *.db.backup*
 *.migrated-to-sqlite
+stops-cache.json

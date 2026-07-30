@@ -37,6 +37,8 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
   - Telegram command handling
   - bus arrival fetching
   - weather fetching
+- `lib/location.mjs`
+  - Google Maps link / coordinate parsing and nearest-stop ranking
   - morning merged notification logic
   - same-day mute logic
 - `.env`
@@ -113,6 +115,20 @@ After the first send, no further messages are pushed for that window. The bot si
   - configure walk-to-stop minutes (default / per stop / off); enables one "leave now" push per service per window when a bus ETA enters the `[walk, walk+2]` minute band
 - `设置时段 17051 晚`
   - limit a stop to the morning (`早`) or evening (`晚`) window; `全部` resets it
+- `重命名 17379 家门口`
+  - rename a monitored stop (stops added from a map get their English dataset name)
+
+### Adding a stop from a map
+
+Looking up a five-digit stop code is the annoying part, so the bot accepts a place instead:
+
+- a native Telegram location share (📎 → Location) — the most reliable route
+- a pasted Google Maps link (`maps.app.goo.gl` short links are resolved by following redirects; only Google's own hosts are ever fetched)
+- raw `lat,lng` text, e.g. `1.32049,103.76389`
+
+The bot answers with the bus stops within 800m, ranked by distance, each with an inline button. Tapping one adds the stop and immediately lists the services currently calling there, each with its own button — so a stop and its routes can be added without typing a single ID.
+
+Stop coordinates come from `https://data.busrouter.sg/v1/stops.min.json` (5205 stops), cached in `stops-cache.json` for 30 days.
 - `上车了`
   - mute the current (or next upcoming) alert window for today; other windows still fire
 - `暂停`
@@ -192,7 +208,7 @@ Relevant entries used in this project:
 - `17379` = `Blk 304`, road `Clementi Ave 6`
 - `17051` = `Opp Regent Pk`, road `Clementi Ave 6`
 
-This dataset was used as reference during setup. Runtime status queries do not depend on it.
+This dataset now backs the "add a stop from a map" flow: it is downloaded on first use, cached in `stops-cache.json` for 30 days, and searched locally to rank stops by distance. Runtime status queries still do not depend on it.
 
 ### 2. Live bus arrivals
 
