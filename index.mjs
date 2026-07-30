@@ -43,6 +43,7 @@ import {
   parseStopsDataset,
 } from "./lib/location.mjs";
 import {
+  applyWindowTime,
   buildAddStopMenu,
   buildDeleteConfirmMenu,
   buildMainMenu,
@@ -53,6 +54,9 @@ import {
   buildThresholdServiceMenu,
   buildThresholdValueMenu,
   buildWalkMenu,
+  buildWindowEditMenu,
+  buildWindowsMenu,
+  buildWindowTimeMenu,
   getStopThresholdLines,
   parseMenuCallback,
   parseRenamePrompt,
@@ -309,6 +313,16 @@ function loadEffectiveStops(state, defaultStops) {
     return cloneStops(state.monitoredStops);
   }
   return cloneStops(defaultStops);
+}
+
+// Windows edited from the menu live in SQLite and win over .env, so a change
+// takes effect on the next cycle instead of needing a restart.
+function loadEffectiveWindows(state, defaultWindows) {
+  const override = state.alertWindowsOverride;
+  if (Array.isArray(override) && override.length > 0) {
+    return override.map((window) => ({ start: window.start, end: window.end }));
+  }
+  return defaultWindows.map((window) => ({ start: window.start, end: window.end }));
 }
 
 function getServiceThresholdMinutes(state, envDefaultMinutes, serviceNo) {
@@ -1658,6 +1672,55 @@ async function handleMenuCallback(context, message, callbackQuery, parsed) {
       break;
     }
 
+    case "win":
+      await showMenuScreen(context, message, buildWindowsMenu(alertWindows));
+      break;
+
+    case "winpick": {
+      const index = Number(args[0]);
+      const window = alertWindows[index];
+      if (!window) {
+        await showMenuScreen(context, message, buildWindowsMenu(alertWindows));
+        break;
+      }
+      await showMenuScreen(context, message, buildWindowEditMenu(index, window));
+      break;
+    }
+
+    case "wintime": {
+      const index = Number(args[0]);
+      const field = args[1];
+      const window = alertWindows[index];
+      if (!window || (field !== "start" && field !== "end")) {
+        await showMenuScreen(context, message, buildWindowsMenu(alertWindows));
+        break;
+      }
+      await showMenuScreen(context, message, buildWindowTimeMenu(index, window, field));
+      break;
+    }
+
+    case "winset": {
+      const index = Number(args[0]);
+      const field = args[1];
+      const time = args[2];
+      const window = alertWindows[index];
+      if (!window || (field !== "start" && field !== "end") || !/^\d{2}:\d{2}$/.test(time)) {
+        await showMenuScreen(context, message, buildWindowsMenu(alertWindows));
+        break;
+      }
+
+      const updated = applyWindowTime(window, field, time);
+      const nextWindows = alertWindows.map((item, itemIndex) =>
+        itemIndex === index ? updated : { start: item.start, end: item.end },
+      );
+      state.alertWindowsOverride = nextWindows;
+      context.alertWindows = nextWindows;
+      notice = `${updated.start}-${updated.end}`;
+      logInfo(`alert window ${index} set to ${updated.start}-${updated.end}`);
+      await showMenuScreen(context, message, buildWindowTimeMenu(index, updated, field));
+      break;
+    }
+
     case "walk":
       await showMenuScreen(context, message, buildWalkMenu(state));
       break;
@@ -2525,7 +2588,7 @@ async function main() {
       state,
       apiBase,
       timeZone,
-      alertWindows,
+      alertWindows: loadEffectiveWindows(state, alertWindows),
       defaultThresholdMinutes: maxMinutes,
       stateFile,
       holidays,
@@ -2551,7 +2614,9 @@ async function main() {
     let lastHeartbeatAt = Date.now();
 
     logInfo(
-      `daemon started, windows=${alertWindows.map((w) => `${w.start}-${w.end}`).join(",")}, timezone=${timeZone}`,
+      `daemon started, windows=${context.alertWindows
+        .map((w) => `${w.start}-${w.end}`)
+        .join(",")}, timezone=${timeZone}`,
     );
 
     try {
@@ -2565,10 +2630,11 @@ async function main() {
       try {
         const now = new Date();
         context.stops = loadEffectiveStops(state, defaultStops);
+        context.alertWindows = loadEffectiveWindows(state, alertWindows);
         context.runCache = { arrivals: new Map() };
         cleanupState(state, now.toISOString(), timeZone);
 
-        const activeWindow = findActiveWindow(now, timeZone, alertWindows);
+        const activeWindow = findActiveWindow(now, timeZone, context.alertWindows);
         const windowLogValue = activeWindow
           ? `${activeWindow.start}-${activeWindow.end}`
           : "none";

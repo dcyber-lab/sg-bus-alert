@@ -26,7 +26,7 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
 - Bus stop `17379` -> `金文泰大牌304` -> service `189`
 - Bus stop `17051` -> `丽晶园对面` -> service `963`
 - Timezone: `Asia/Singapore`
-- Alert windows: `08:30-09:30` and `17:30-18:30`
+- Alert windows: `08:30-09:30` and `18:30-19:30` (editable from the settings menu; the stored value overrides `.env`)
 - Threshold: `8` minutes
 - Telegram bot: `@sg_bus_alert_bot`
 
@@ -106,6 +106,8 @@ Configuration is done by tapping buttons, not by typing commands. `⚙️ 设置
           │              └─ 🗑 删除站点   → confirmation step
           ├─ ➕ 添加站点  → share a location / paste a Maps link
           ├─ 🚶 出门提醒  → 2/3/4/5/6/8/10 分钟 or off
+          ├─ 🕐 提醒时间段 → pick a window → move its start or end on a
+          │                  half-hour grid centred on the current value
           └─ ❌ 关闭
 ```
 
@@ -192,6 +194,8 @@ Stored fields include:
   - per-window record of services already pinged (max one push per service per window)
 - `failureStreak`
   - consecutive failed daemon cycles, used for the self-diagnosis alert
+- `alertWindowsOverride`
+  - alert windows edited from the menu; takes precedence over the `.env` values and applies on the next cycle without a restart
 
 Example:
 

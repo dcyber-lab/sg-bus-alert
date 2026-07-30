@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  applyWindowTime,
   buildDeleteConfirmMenu,
   buildMainMenu,
   buildPeriodMenu,
@@ -11,11 +12,21 @@ import {
   buildThresholdServiceMenu,
   buildThresholdValueMenu,
   buildWalkMenu,
+  buildWindowEditMenu,
+  buildWindowsMenu,
+  buildWindowTimeMenu,
   describeStopPeriod,
+  generateTimeChoices,
   getStopWalkMinutes,
+  minuteToHhmm,
   parseMenuCallback,
   parseRenamePrompt,
 } from "../lib/menu.mjs";
+
+const WINDOWS = [
+  { start: "08:30", end: "09:30" },
+  { start: "18:30", end: "19:30" },
+];
 
 const STOPS = [
   { stop_id: "17379", stop_name: "金文泰大牌304", services: ["189"] },
@@ -41,6 +52,10 @@ test("every menu keeps callback_data within Telegram's 64-byte limit", () => {
     buildPeriodMenu(STOPS[1]),
     buildWalkMenu(state),
     buildDeleteConfirmMenu(STOPS[0]),
+    buildWindowsMenu(WINDOWS),
+    buildWindowEditMenu(1, WINDOWS[1]),
+    buildWindowTimeMenu(1, WINDOWS[1], "start"),
+    buildWindowTimeMenu(1, WINDOWS[1], "end"),
   ];
 
   for (const menu of menus) {
@@ -65,6 +80,7 @@ test("main menu lists one button per stop plus the global actions", () => {
     "m:stop:17051",
     "m:add",
     "m:walk",
+    "m:win",
     "m:close",
   ]);
 });
@@ -73,7 +89,7 @@ test("main menu guides the user when nothing is monitored yet", () => {
   const menu = buildMainMenu([], {}, 8);
 
   assert.match(menu.text, /还没有监控任何站点/);
-  assert.deepEqual(callbackDataOf(menu.replyMarkup), ["m:add", "m:walk", "m:close"]);
+  assert.deepEqual(callbackDataOf(menu.replyMarkup), ["m:add", "m:walk", "m:win", "m:close"]);
 });
 
 test("routes menu offers removal for monitored and addition for the rest", () => {
@@ -164,6 +180,89 @@ test("rename prompt round-trips the stop id so the reply needs no stored state",
 
   assert.equal(parseRenamePrompt(prompt), "17379");
   assert.equal(parseRenamePrompt("随便一句话"), null);
+});
+
+test("windows menu labels each window by period and links to its editor", () => {
+  const menu = buildWindowsMenu(WINDOWS);
+
+  assert.match(menu.text, /晨间：08:30 – 09:30/);
+  assert.match(menu.text, /晚间：18:30 – 19:30/);
+  assert.deepEqual(callbackDataOf(menu.replyMarkup), ["m:winpick:0", "m:winpick:1", "m:back"]);
+});
+
+test("window editor offers both ends and returns to the window list", () => {
+  const menu = buildWindowEditMenu(1, WINDOWS[1]);
+
+  assert.deepEqual(callbackDataOf(menu.replyMarkup), [
+    "m:wintime:1:start",
+    "m:wintime:1:end",
+    "m:win",
+  ]);
+});
+
+test("generateTimeChoices centres a half-hour grid on the current value", () => {
+  assert.deepEqual(generateTimeChoices("18:30"), [
+    "16:30",
+    "17:00",
+    "17:30",
+    "18:00",
+    "18:30",
+    "19:00",
+    "19:30",
+    "20:00",
+    "20:30",
+  ]);
+});
+
+test("generateTimeChoices clamps at the ends of the day", () => {
+  const early = generateTimeChoices("00:30");
+  const late = generateTimeChoices("23:00");
+
+  assert.equal(early[0], "00:00");
+  assert.ok(early.every((time) => time >= "00:00"));
+  assert.equal(late.at(-1), "23:30");
+});
+
+test("window time menu marks the current value and offers every choice", () => {
+  const menu = buildWindowTimeMenu(1, WINDOWS[1], "start");
+  const selected = allButtons(menu.replyMarkup).filter((button) => button.text.startsWith("✅"));
+
+  assert.deepEqual(
+    selected.map((button) => button.callback_data),
+    ["m:winset:1:start:18:30"],
+  );
+  assert.ok(callbackDataOf(menu.replyMarkup).includes("m:winpick:1"));
+});
+
+test("applyWindowTime keeps the window at least half an hour long", () => {
+  assert.deepEqual(applyWindowTime(WINDOWS[1], "start", "19:00"), {
+    start: "19:00",
+    end: "19:30",
+  });
+
+  // Dragging the start past the end pushes the end out instead of inverting.
+  assert.deepEqual(applyWindowTime(WINDOWS[1], "start", "20:00"), {
+    start: "20:00",
+    end: "21:00",
+  });
+
+  // Same in reverse when the end is moved before the start.
+  assert.deepEqual(applyWindowTime(WINDOWS[1], "end", "18:00"), {
+    start: "17:00",
+    end: "18:00",
+  });
+
+  assert.deepEqual(applyWindowTime(WINDOWS[1], "end", "20:30"), {
+    start: "18:30",
+    end: "20:30",
+  });
+});
+
+test("minuteToHhmm formats and clamps into a valid clock time", () => {
+  assert.equal(minuteToHhmm(0), "00:00");
+  assert.equal(minuteToHhmm(8 * 60 + 30), "08:30");
+  assert.equal(minuteToHhmm(-30), "00:00");
+  assert.equal(minuteToHhmm(24 * 60), "23:30");
 });
 
 test("parseMenuCallback splits action and arguments, ignoring other callbacks", () => {

@@ -9,7 +9,8 @@ This is a small local automation project for Singapore bus alerts on Telegram.
 - Monitor:
   - `189` at `17379` `金文泰大牌304`
   - `963` at `17051` `丽晶园对面`
-- Weekday alert windows: `08:30-09:30` and `17:30-18:30` (Asia/Singapore); Singapore public holidays skipped
+- Weekday alert windows: `08:30-09:30` and `18:30-19:30` (Asia/Singapore); Singapore public holidays skipped
+- Windows are editable from the menu and stored as `alertWindowsOverride`, which wins over `.env` and applies next cycle without a restart
 - One proactive message per window, then silent in-place edits (~10s) — no repeated pushes
 - Optional walk-time departure pings (`步行 <分钟>`): max one "leave now" push per service per window
 - Stops can be limited to 早/晚 windows via `设置时段`, renamed via `重命名`
