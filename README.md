@@ -16,6 +16,12 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
   - weather summary (Open-Meteo daily + data.gov.sg 2-hour nowcast)
   - the next 3 buses for every monitored service in that window
   - current ETA, load, vehicle type, and arrival clock time
+- A stop with 3+ monitored routes switches to a compact layout: one time-sorted list of the soonest buses across all its routes (a 4-route stop goes from ~77 lines to ~7). Forceable either way from 🖥 显示方式.
+- When the nowcast says rain, the alert threshold widens by `RAIN_EXTRA_MINUTES` (default 3) and the message carries an umbrella reminder.
+- Pressing 🛑 我上车了 is recorded in `boarding_log`; 📊 我的统计 reports the average, earliest and latest boarding time per window and suggests a better window once there are 5+ records.
+- Departure pings carry a "⏰ 5 分钟后再提醒" snooze button.
+- Active weekdays are configurable (📅 生效星期); the default stays Mon–Fri.
+- Config (stops, routes, thresholds, windows, walk time, weekdays, display mode) is mirrored to `config-backup.json` on boot and on every change, so a corrupt `state.db` is recoverable.
 - Supports Telegram chat commands for on-demand status lookup.
 - Supports boarding mute (`上车了`, current window only) and whole-day mute (`暂停`).
 - Uses a lock file so a second instance exits cleanly instead of double-polling Telegram.
@@ -39,6 +45,10 @@ This project runs on `/home/minipc/sg-bus-alert` and uses a single Node.js scrip
   - weather fetching
 - `lib/location.mjs`
   - Google Maps link / coordinate parsing and nearest-stop ranking
+- `lib/render.mjs`
+  - arrival formatting, compact vs detailed stop sections, rain detection
+- `lib/menu.mjs`
+  - button-menu screens
   - morning merged notification logic
   - same-day mute logic
 - `.env`
@@ -108,6 +118,9 @@ Configuration is done by tapping buttons, not by typing commands. `⚙️ 设置
           ├─ 🚶 出门提醒  → 2/3/4/5/6/8/10 分钟 or off
           ├─ 🕐 提醒时间段 → pick a window → move its start or end on a
           │                  half-hour grid centred on the current value
+          ├─ 📅 生效星期  → toggle each weekday
+          ├─ 📊 我的统计  → boarding habits per window + window suggestion
+          ├─ 🖥 显示方式  → 自动 / 总是紧凑 / 总是详细
           └─ ❌ 关闭
 ```
 
@@ -196,6 +209,14 @@ Stored fields include:
   - consecutive failed daemon cycles, used for the self-diagnosis alert
 - `alertWindowsOverride`
   - alert windows edited from the menu; takes precedence over the `.env` values and applies on the next cycle without a restart
+- `activeWeekdays`
+  - which weekdays the windows run on, default Mon–Fri
+- `displayMode`
+  - `compact` / `detailed`; absent means auto
+- `departureSnooze`
+  - per-service snooze deadlines for departure pings
+
+Two extra SQLite tables: `alert_history` (one row per service per window) and `boarding_log` (one row per 🛑 我上车了 press, feeding 📊 我的统计).
 
 Example:
 
@@ -360,6 +381,8 @@ Current config keys:
   - optional comma-separated `YYYY-MM-DD` dates appended to the built-in Singapore holiday table (`DEFAULT_SG_PUBLIC_HOLIDAYS` in `index.mjs`, refresh yearly)
 - `FAILURE_ALERT_AFTER`
   - consecutive failed cycles before the self-diagnosis warning, default `30`
+- `RAIN_EXTRA_MINUTES`
+  - extra alert threshold when the nowcast says rain, default `3`
 - `STATE_FILE`
   - legacy JSON migration source path; corresponding `.db` path is used as the primary runtime store
 - `STOP_CONFIG_JSON`

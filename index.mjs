@@ -16,6 +16,8 @@ import {
   buildAvailableCommandsHint,
   buildHelpMessage,
   buildTelegramButtons,
+  DEFAULT_ACTIVE_WEEKDAYS,
+  normalizeActiveWeekdays,
   parseAlertWindows,
   parseDateKeySet,
   parseServiceCallbackData,
@@ -28,7 +30,16 @@ import {
   windowPeriodLabel,
 } from "./lib/runtime-helpers.mjs";
 import {
+  buildStopSections,
+  formatArrivalClock,
+  isRainyForecast,
+  loadLabel,
+  minutesLabel,
+} from "./lib/render.mjs";
+import {
   logAlertToHistory as logAlertToHistoryFromStore,
+  logBoarding as logBoardingToStore,
+  readBoardingStats as readBoardingStatsFromStore,
   readState as readStateFromStore,
   writeState as writeStateFromStore,
 } from "./lib/state-store.mjs";
@@ -54,6 +65,9 @@ import {
   buildThresholdServiceMenu,
   buildThresholdValueMenu,
   buildWalkMenu,
+  buildDisplayMenu,
+  buildStatsMenu,
+  buildWeekdaysMenu,
   buildWindowEditMenu,
   buildWindowsMenu,
   buildWindowTimeMenu,
@@ -74,6 +88,17 @@ const STOPS_CACHE_FILE = "stops-cache.json";
 const STOPS_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const NEARBY_STOP_LIMIT = 5;
 const NEARBY_RADIUS_METERS = 800;
+const SNOOZE_MINUTES = 5;
+const CONFIG_BACKUP_FILE = "config-backup.json";
+const CONFIG_BACKUP_KEYS = [
+  "monitoredStops",
+  "serviceThresholdMinutes",
+  "alertWindowsOverride",
+  "walkMinutesDefault",
+  "walkMinutesByStop",
+  "activeWeekdays",
+  "displayMode",
+];
 
 // MOM-announced Singapore public holidays; refresh once a year, extend via PUBLIC_HOLIDAYS env.
 const DEFAULT_SG_PUBLIC_HOLIDAYS = [
@@ -229,68 +254,14 @@ function getLocalParts(date, timeZone) {
   };
 }
 
-function isWithinWindow(date, timeZone, start, end) {
+function isWithinWindow(date, timeZone, start, end, activeWeekdays = DEFAULT_ACTIVE_WEEKDAYS) {
   const { weekday, hour, minute } = getLocalParts(date, timeZone);
-  const weekdays = new Set(["Mon", "Tue", "Wed", "Thu", "Fri"]);
-  if (!weekdays.has(weekday)) {
+  if (!normalizeActiveWeekdays(activeWeekdays).includes(weekday)) {
     return false;
   }
 
   const currentMinute = hour * 60 + minute;
   return currentMinute >= getMinuteOfDay(start) && currentMinute <= getMinuteOfDay(end);
-}
-
-function loadLabel(code) {
-  switch (code) {
-    case "SEA":
-      return "有座位";
-    case "SDA":
-      return "可站立";
-    case "LSD":
-      return "较拥挤";
-    default:
-      return code || "Unknown";
-  }
-}
-
-function vehicleTypeLabel(code) {
-  switch (code) {
-    case "SD":
-      return "单层";
-    case "DD":
-      return "双层";
-    case "BD":
-      return "铰接巴士";
-    default:
-      return code || "Unknown";
-  }
-}
-
-function minutesLabel(durationMs) {
-  const minutes = Math.max(0, Math.ceil(durationMs / 60000));
-  if (minutes === 0) {
-    return "即将到站";
-  }
-  if (minutes === 1) {
-    return "1 分钟";
-  }
-  return `${minutes} 分钟`;
-}
-
-function formatArrivalClock(isoString, timeZone) {
-  if (!isoString) {
-    return "";
-  }
-
-  const formatter = new Intl.DateTimeFormat("zh-CN", {
-    timeZone,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-
-  return formatter.format(new Date(isoString));
 }
 
 function formatDateKey(date, timeZone) {
@@ -357,8 +328,16 @@ function getWindowNotices(state) {
   return state.windowNotices;
 }
 
-function findActiveWindow(now, timeZone, windows) {
-  return windows.find((window) => isWithinWindow(now, timeZone, window.start, window.end)) || null;
+function findActiveWindow(now, timeZone, windows, activeWeekdays) {
+  return (
+    windows.find((window) =>
+      isWithinWindow(now, timeZone, window.start, window.end, activeWeekdays),
+    ) || null
+  );
+}
+
+function getActiveWeekdays(state) {
+  return normalizeActiveWeekdays(state.activeWeekdays);
 }
 
 function isProactiveMutedNow(state, timeZone, windows) {
@@ -367,7 +346,7 @@ function isProactiveMutedNow(state, timeZone, windows) {
   if (isDayMuted(state, dateKey)) {
     return true;
   }
-  const activeWindow = findActiveWindow(now, timeZone, windows);
+  const activeWindow = findActiveWindow(now, timeZone, windows, getActiveWeekdays(state));
   return Boolean(
     activeWindow && getMutedWindowKeys(state).includes(windowKeyFor(dateKey, activeWindow)),
   );
@@ -859,35 +838,18 @@ function flattenStopServices(stops) {
   return rows;
 }
 
-function buildArrivalSlot(label, arrival, timeZone) {
-  if (!arrival || typeof arrival.duration_ms !== "number" || !arrival.time) {
-    return `${label}：暂无数据`;
-  }
-
-  return [
-    `${label}：${minutesLabel(arrival.duration_ms)}`,
-    `   👥 ${loadLabel(arrival.load)}`,
-    `   🚍 ${vehicleTypeLabel(arrival.type)}`,
-    `   🕒 ${formatArrivalClock(arrival.time, timeZone)}`,
-  ].join("\n");
+function joinStopSections(items, timeZone, displayMode) {
+  return buildStopSections(items, timeZone, displayMode).join("\n\n────────\n\n");
 }
 
-function buildStatusLine(stopName, serviceNo, arrivals, timeZone) {
-  const lines = [
-    `🚌 ${serviceNo}`,
-    `📍 ${stopName}`,
-    ``,
-    buildArrivalSlot("第 1 趟", arrivals[0], timeZone),
-    ``,
-    buildArrivalSlot("第 2 趟", arrivals[1], timeZone),
-    ``,
-    buildArrivalSlot("第 3 趟", arrivals[2], timeZone),
-  ];
-
-  return lines.join("\n");
-}
-
-function buildStatusMessage(items, timeZone, stops, weatherSummary = null, muteStatus = null) {
+function buildStatusMessage(
+  items,
+  timeZone,
+  stops,
+  weatherSummary = null,
+  muteStatus = null,
+  displayMode = "auto",
+) {
   const lines = ["🚏 手动查询状态", ""];
 
   if (muteStatus) {
@@ -904,15 +866,7 @@ function buildStatusMessage(items, timeZone, stops, weatherSummary = null, muteS
     lines.push("");
   }
 
-  items.forEach((item, index) => {
-    lines.push(buildStatusLine(item.stop.stop_name, item.serviceNo, item.arrivals, timeZone));
-    if (index !== items.length - 1) {
-      lines.push("");
-      lines.push("────────");
-      lines.push("");
-    }
-  });
-
+  lines.push(joinStopSections(items, timeZone, displayMode));
   lines.push("");
   lines.push(`更新时间：${formatArrivalClock(new Date().toISOString(), timeZone)}`);
   lines.push(buildAvailableCommandsHint(stops));
@@ -934,8 +888,62 @@ function buildDeparturePingMessage(pings, timeZone) {
   return lines.join("\n");
 }
 
-function buildWindowNoticeMessage(items, timeZone, weatherSummary, periodLabel, hasTriggered, footerLine) {
+function buildDeparturePingKeyboard(pings, windowKey) {
+  const [dateKey, windowStart] = windowKey.split("|");
+  return {
+    inline_keyboard: [
+      pings.slice(0, 2).map((ping) => ({
+        text: `⏰ ${SNOOZE_MINUTES} 分钟后再提醒 ${ping.serviceNo}`,
+        callback_data: `m:snooze:${dateKey}:${windowStart}:${ping.stop.stop_id}:${ping.serviceNo}`,
+      })),
+      [{ text: "🛑 我上车了", callback_data: "boarded" }],
+    ],
+  };
+}
+
+async function writeConfigBackup(stateFile, state) {
+  const backup = {};
+  for (const key of CONFIG_BACKUP_KEYS) {
+    if (state[key] !== undefined) {
+      backup[key] = state[key];
+    }
+  }
+
+  const snapshot = JSON.stringify(backup);
+  const backupPath = path.join(path.dirname(stateFile), CONFIG_BACKUP_FILE);
+  try {
+    const existing = JSON.parse(await fs.readFile(backupPath, "utf8"));
+    if (JSON.stringify(existing.config) === snapshot) {
+      return false;
+    }
+  } catch {
+    // no readable backup yet; write a fresh one
+  }
+
+  await fs.writeFile(
+    backupPath,
+    `${JSON.stringify({ savedAt: new Date().toISOString(), config: backup }, null, 2)}\n`,
+    "utf8",
+  );
+  logInfo("config backup updated");
+  return true;
+}
+
+function buildWindowNoticeMessage(
+  items,
+  timeZone,
+  weatherSummary,
+  periodLabel,
+  hasTriggered,
+  footerLine,
+  { displayMode = "auto", rainy = false } = {},
+) {
   const lines = [`⏰ ${periodLabel}出行提醒`, ""];
+
+  if (rainy) {
+    lines.push("☔ 有雨，记得带伞（已提前提醒）");
+    lines.push("");
+  }
 
   if (weatherSummary) {
     lines.push(weatherSummary);
@@ -944,15 +952,7 @@ function buildWindowNoticeMessage(items, timeZone, weatherSummary, periodLabel, 
     lines.push("");
   }
 
-  items.forEach((item, index) => {
-    lines.push(buildStatusLine(item.stop.stop_name, item.serviceNo, item.arrivals, timeZone));
-    if (index !== items.length - 1) {
-      lines.push("");
-      lines.push("────────");
-      lines.push("");
-    }
-  });
-
+  lines.push(joinStopSections(items, timeZone, displayMode));
   lines.push("");
   lines.push(hasTriggered ? "⚡ 车快到了，可以准备出发了" : "⏳ 暂时没有临近的车");
   lines.push(footerLine);
@@ -1057,6 +1057,20 @@ function cleanupState(state, nowIso, timeZone) {
     }
   } else if (pings !== undefined) {
     delete state.departurePings;
+  }
+
+  const snoozes = state.departureSnooze;
+  if (snoozes && typeof snoozes === "object" && !Array.isArray(snoozes)) {
+    for (const key of Object.keys(snoozes)) {
+      if (!key.startsWith(`${todayKey}|`)) {
+        delete snoozes[key];
+      }
+    }
+    if (Object.keys(snoozes).length === 0) {
+      delete state.departureSnooze;
+    }
+  } else if (snoozes !== undefined) {
+    delete state.departureSnooze;
   }
 }
 
@@ -1178,7 +1192,7 @@ async function proactiveTick(context, now) {
     const stillActive =
       noticeDateKey === todayKey &&
       window &&
-      isWithinWindow(now, timeZone, window.start, window.end);
+      isWithinWindow(now, timeZone, window.start, window.end, getActiveWeekdays(state));
     if (stillActive) {
       continue;
     }
@@ -1226,19 +1240,26 @@ async function proactiveTick(context, now) {
     return;
   }
 
+  const weatherSummary = await context.getWeatherSummary();
+  const rainy = isRainyForecast(weatherSummary);
+  // Rain means a slower walk and a fuller bus, so start nudging earlier.
+  const effectiveThreshold = rainy
+    ? defaultThresholdMinutes + context.rainExtraMinutes
+    : defaultThresholdMinutes;
+
   const { items, triggered } = await evaluateWindowServices(
     apiBase,
     windowStops,
     state,
-    defaultThresholdMinutes,
+    effectiveThreshold,
     runCache,
   );
   const periodLabel = windowPeriodLabel(activeWindow);
+  const displayMode = state.displayMode || "auto";
   const existingNotice = notices[windowKey];
 
   if (!existingNotice) {
     if (triggered.length > 0 && items.length > 0) {
-      const weatherSummary = await context.getWeatherSummary();
       const text = buildWindowNoticeMessage(
         items,
         timeZone,
@@ -1246,6 +1267,7 @@ async function proactiveTick(context, now) {
         periodLabel,
         true,
         `🔄 自动刷新中｜更新时间：${nowClock}`,
+        { displayMode, rainy },
       );
       const sent = await sendTelegramMessage(token, {
         chat_id: chatId,
@@ -1271,7 +1293,6 @@ async function proactiveTick(context, now) {
       );
     }
   } else if (!existingNotice.finalized) {
-    const weatherSummary = await context.getWeatherSummary();
     const text = buildWindowNoticeMessage(
       items,
       timeZone,
@@ -1279,6 +1300,7 @@ async function proactiveTick(context, now) {
       periodLabel,
       triggered.length > 0,
       `🔄 自动刷新中｜更新时间：${nowClock}`,
+      { displayMode, rainy },
     );
 
     if (text !== existingNotice.lastText && existingNotice.messageId) {
@@ -1331,6 +1353,10 @@ async function proactiveTick(context, now) {
     if (state.departurePings?.[windowKey]?.includes(rowKey)) {
       continue;
     }
+    const snoozeUntil = state.departureSnooze?.[`${windowKey}|${rowKey}`];
+    if (Number.isFinite(snoozeUntil) && Date.now() < snoozeUntil) {
+      continue;
+    }
     const candidate = pickDepartureCandidate(item.arrivals, walkMinutes);
     if (!candidate) {
       continue;
@@ -1343,7 +1369,7 @@ async function proactiveTick(context, now) {
       chat_id: chatId,
       text: buildDeparturePingMessage(pings, timeZone),
       disable_web_page_preview: true,
-      reply_markup: buildTelegramButtons(stops, false),
+      reply_markup: buildDeparturePingKeyboard(pings, windowKey),
     });
     if (
       !state.departurePings ||
@@ -1721,6 +1747,67 @@ async function handleMenuCallback(context, message, callbackQuery, parsed) {
       break;
     }
 
+    case "days":
+      await showMenuScreen(context, message, buildWeekdaysMenu(state.activeWeekdays));
+      break;
+
+    case "daytoggle": {
+      const day = args[0];
+      const current = normalizeActiveWeekdays(state.activeWeekdays);
+      const next = current.includes(day)
+        ? current.filter((item) => item !== day)
+        : [...current, day];
+      state.activeWeekdays = normalizeActiveWeekdays(next);
+      notice = describeActiveWeekdays(state.activeWeekdays);
+      logInfo(`active weekdays = ${state.activeWeekdays.join(",")}`);
+      await showMenuScreen(context, message, buildWeekdaysMenu(state.activeWeekdays));
+      break;
+    }
+
+    case "display":
+      await showMenuScreen(context, message, buildDisplayMenu(state.displayMode || "auto"));
+      break;
+
+    case "displayset": {
+      const mode = args[0];
+      if (!["auto", "compact", "detailed"].includes(mode)) {
+        break;
+      }
+      if (mode === "auto") {
+        delete state.displayMode;
+      } else {
+        state.displayMode = mode;
+      }
+      notice = "显示方式已更新";
+      await showMenuScreen(context, message, buildDisplayMenu(mode));
+      break;
+    }
+
+    case "stats": {
+      const stats = await readBoardingStatsFromStore(context.stateFile);
+      await showMenuScreen(context, message, buildStatsMenu(stats, alertWindows));
+      break;
+    }
+
+    case "snooze": {
+      const windowKey = `${args[0]}|${args[1]}`;
+      const rowKey = `${args[2]}:${args[3]}`;
+      const until = Date.now() + SNOOZE_MINUTES * 60 * 1000;
+      if (!state.departureSnooze || typeof state.departureSnooze !== "object") {
+        state.departureSnooze = {};
+      }
+      state.departureSnooze[`${windowKey}|${rowKey}`] = until;
+      if (Array.isArray(state.departurePings?.[windowKey])) {
+        state.departurePings[windowKey] = state.departurePings[windowKey].filter(
+          (item) => item !== rowKey,
+        );
+      }
+      notice = `好，${SNOOZE_MINUTES} 分钟后再提醒`;
+      logInfo(`departure ping snoozed for ${rowKey}`);
+      await answerTelegramCallbackQuery(token, callbackQuery.id, notice);
+      return;
+    }
+
     case "walk":
       await showMenuScreen(context, message, buildWalkMenu(state));
       break;
@@ -1907,11 +1994,13 @@ async function processTelegramCommands(context, pollSeconds) {
     const todayKey = formatDateKey(new Date(), timeZone);
 
     if (text === "上车了") {
-      const { hour, minute } = getLocalParts(new Date(), timeZone);
+      const { hour, minute, second } = getLocalParts(new Date(), timeZone);
       const targetWindow = pickBoardedWindow(hour * 60 + minute, alertWindows);
       const targetKey = targetWindow ? windowKeyFor(todayKey, targetWindow) : null;
       if (targetKey) {
         addMutedWindowKey(state, targetKey);
+        const clock = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}:${String(second).padStart(2, "0")}`;
+        await logBoardingToStore(context.stateFile, targetKey, clock);
       }
 
       const notices = getWindowNotices(state);
@@ -2011,7 +2100,16 @@ async function processTelegramCommands(context, pollSeconds) {
         }
         const start = key.slice(todayKey.length + 1);
         const window = alertWindows.find((item) => item.start === start);
-        if (window && isWithinWindow(nowForResume, timeZone, window.start, window.end)) {
+        if (
+          window &&
+          isWithinWindow(
+            nowForResume,
+            timeZone,
+            window.start,
+            window.end,
+            getActiveWeekdays(state),
+          )
+        ) {
           notice.finalized = false;
         }
       }
@@ -2492,13 +2590,13 @@ async function processTelegramCommands(context, pollSeconds) {
         token,
         chatId,
         message.message_id,
-        buildStatusMessage(statuses, timeZone, stops, weatherSummary, muteStatus),
+        buildStatusMessage(statuses, timeZone, stops, weatherSummary, muteStatus, state.displayMode),
         buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
       );
     } else {
       await sendTelegramMessage(token, {
         chat_id: chatId,
-        text: buildStatusMessage(statuses, timeZone, stops, weatherSummary, muteStatus),
+        text: buildStatusMessage(statuses, timeZone, stops, weatherSummary, muteStatus, state.displayMode),
         reply_to_message_id: message.message_id,
         disable_web_page_preview: true,
         reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
@@ -2530,6 +2628,9 @@ async function main() {
   for (const key of DEFAULT_SG_PUBLIC_HOLIDAYS) {
     holidays.add(key);
   }
+  const parsedRainExtra = Number(env.RAIN_EXTRA_MINUTES);
+  const rainExtraMinutes =
+    Number.isFinite(parsedRainExtra) && parsedRainExtra >= 0 ? parsedRainExtra : 3;
   const parsedFailureAlertAfter = Number(env.FAILURE_ALERT_AFTER);
   const failureAlertAfter =
     Number.isFinite(parsedFailureAlertAfter) && parsedFailureAlertAfter > 0
@@ -2590,6 +2691,7 @@ async function main() {
       timeZone,
       alertWindows: loadEffectiveWindows(state, alertWindows),
       defaultThresholdMinutes: maxMinutes,
+      rainExtraMinutes,
       stateFile,
       holidays,
       stops: [],
@@ -2606,6 +2708,11 @@ async function main() {
       if (snapshot !== lastPersisted) {
         await writeStateFromStore(stateFile, state);
         lastPersisted = snapshot;
+        try {
+          await writeConfigBackup(stateFile, state);
+        } catch (error) {
+          logInfo(`config backup failed: ${describeError(error)}`);
+        }
       }
     };
 
@@ -2623,6 +2730,14 @@ async function main() {
       await registerBotCommands(token);
     } catch (error) {
       logInfo(`bot command registration skipped: ${describeError(error)}`);
+    }
+
+    // Back up on boot too: a config that never changes again would otherwise
+    // never get a backup, which is exactly the case worth protecting.
+    try {
+      await writeConfigBackup(stateFile, state);
+    } catch (error) {
+      logInfo(`config backup failed: ${describeError(error)}`);
     }
 
     do {

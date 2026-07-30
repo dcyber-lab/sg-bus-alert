@@ -12,6 +12,10 @@ This is a small local automation project for Singapore bus alerts on Telegram.
 - Weekday alert windows: `08:30-09:30` and `18:30-19:30` (Asia/Singapore); Singapore public holidays skipped
 - Windows are editable from the menu and stored as `alertWindowsOverride`, which wins over `.env` and applies next cycle without a restart
 - One proactive message per window, then silent in-place edits (~10s) — no repeated pushes
+- Stops with 3+ routes render compact (time-sorted list across routes); 🖥 显示方式 forces either layout
+- Rain in the nowcast widens the threshold by `RAIN_EXTRA_MINUTES` and adds an umbrella line
+- 🛑 我上车了 is logged to `boarding_log`; 📊 我的统计 turns it into habits + a window suggestion
+- Active weekdays configurable (📅 生效星期); config mirrored to `config-backup.json`
 - Optional walk-time departure pings (`步行 <分钟>`): max one "leave now" push per service per window
 - Stops can be limited to 早/晚 windows via `设置时段`, renamed via `重命名`
 - Adding a stop: share a Telegram location, paste a Google Maps link, or send `lat,lng`; the bot lists stops within 800m as buttons, then lists that stop's services as buttons

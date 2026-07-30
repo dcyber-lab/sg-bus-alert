@@ -11,7 +11,10 @@ import {
   buildStopMenu,
   buildThresholdServiceMenu,
   buildThresholdValueMenu,
+  buildDisplayMenu,
+  buildStatsMenu,
   buildWalkMenu,
+  buildWeekdaysMenu,
   buildWindowEditMenu,
   buildWindowsMenu,
   buildWindowTimeMenu,
@@ -21,6 +24,7 @@ import {
   minuteToHhmm,
   parseMenuCallback,
   parseRenamePrompt,
+  suggestWindowFromStats,
 } from "../lib/menu.mjs";
 
 const WINDOWS = [
@@ -56,6 +60,9 @@ test("every menu keeps callback_data within Telegram's 64-byte limit", () => {
     buildWindowEditMenu(1, WINDOWS[1]),
     buildWindowTimeMenu(1, WINDOWS[1], "start"),
     buildWindowTimeMenu(1, WINDOWS[1], "end"),
+    buildWeekdaysMenu(["Mon", "Wed"]),
+    buildDisplayMenu("compact"),
+    buildStatsMenu([], WINDOWS),
   ];
 
   for (const menu of menus) {
@@ -81,6 +88,9 @@ test("main menu lists one button per stop plus the global actions", () => {
     "m:add",
     "m:walk",
     "m:win",
+    "m:days",
+    "m:stats",
+    "m:display",
     "m:close",
   ]);
 });
@@ -89,7 +99,15 @@ test("main menu guides the user when nothing is monitored yet", () => {
   const menu = buildMainMenu([], {}, 8);
 
   assert.match(menu.text, /还没有监控任何站点/);
-  assert.deepEqual(callbackDataOf(menu.replyMarkup), ["m:add", "m:walk", "m:win", "m:close"]);
+  assert.deepEqual(callbackDataOf(menu.replyMarkup), [
+    "m:add",
+    "m:walk",
+    "m:win",
+    "m:days",
+    "m:stats",
+    "m:display",
+    "m:close",
+  ]);
 });
 
 test("routes menu offers removal for monitored and addition for the rest", () => {
@@ -263,6 +281,72 @@ test("minuteToHhmm formats and clamps into a valid clock time", () => {
   assert.equal(minuteToHhmm(8 * 60 + 30), "08:30");
   assert.equal(minuteToHhmm(-30), "00:00");
   assert.equal(minuteToHhmm(24 * 60), "23:30");
+});
+
+test("weekday menu marks the selected days and toggles each one", () => {
+  const menu = buildWeekdaysMenu(["Mon", "Wed"]);
+
+  assert.match(menu.text, /当前：周一、三/);
+  assert.deepEqual(
+    allButtons(menu.replyMarkup)
+      .filter((button) => button.text.startsWith("✅"))
+      .map((button) => button.callback_data),
+    ["m:daytoggle:Mon", "m:daytoggle:Wed"],
+  );
+});
+
+test("display menu marks the active mode", () => {
+  const menu = buildDisplayMenu("compact");
+  const selected = allButtons(menu.replyMarkup).filter((button) => button.text.startsWith("✅"));
+
+  assert.deepEqual(
+    selected.map((button) => button.callback_data),
+    ["m:displayset:compact"],
+  );
+});
+
+test("stats menu explains itself before any boarding is recorded", () => {
+  const menu = buildStatsMenu([], WINDOWS);
+
+  assert.match(menu.text, /还没有记录/);
+  assert.deepEqual(callbackDataOf(menu.replyMarkup), ["m:back"]);
+});
+
+test("stats menu reports per-window boarding habits", () => {
+  const menu = buildStatsMenu(
+    [{ windowStart: "18:30", count: 12, earliest: "18:40:00", latest: "19:05:00", averageMinute: 1132 }],
+    WINDOWS,
+  );
+
+  assert.match(menu.text, /晚间（18:30 起）/);
+  assert.match(menu.text, /平均上车：18:52/);
+  assert.match(menu.text, /共 12 次/);
+});
+
+test("suggestWindowFromStats pads around observed boardings and stays quiet when already right", () => {
+  const window = { start: "18:30", end: "19:30" };
+
+  assert.deepEqual(
+    suggestWindowFromStats(
+      { earliest: "18:40:00", latest: "19:05:00", count: 12 },
+      window,
+    ),
+    { start: "18:00", end: "19:30" },
+  );
+
+  // Boarding close to the closing edge argues for a later end.
+  assert.deepEqual(
+    suggestWindowFromStats({ earliest: "18:45:00", latest: "19:20:00", count: 9 }, window),
+    { start: "18:30", end: "20:00" },
+  );
+
+  // Nothing to say when the padded range is the window we already have.
+  assert.equal(
+    suggestWindowFromStats({ earliest: "18:45:00", latest: "19:00:00", count: 9 }, window),
+    null,
+  );
+
+  assert.equal(suggestWindowFromStats({}, window), null);
 });
 
 test("parseMenuCallback splits action and arguments, ignoring other callbacks", () => {

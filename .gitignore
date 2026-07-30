@@ -13,3 +13,4 @@ state.json
 *.db.backup*
 *.migrated-to-sqlite
 stops-cache.json
+config-backup.json
