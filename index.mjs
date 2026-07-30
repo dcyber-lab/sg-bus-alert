@@ -42,6 +42,21 @@ import {
   looksLikeLocationInput,
   parseStopsDataset,
 } from "./lib/location.mjs";
+import {
+  buildAddStopMenu,
+  buildDeleteConfirmMenu,
+  buildMainMenu,
+  buildPeriodMenu,
+  buildRenamePrompt,
+  buildRoutesMenu,
+  buildStopMenu,
+  buildThresholdServiceMenu,
+  buildThresholdValueMenu,
+  buildWalkMenu,
+  getStopThresholdLines,
+  parseMenuCallback,
+  parseRenamePrompt,
+} from "./lib/menu.mjs";
 
 const ENV_PATH = path.join(process.cwd(), ".env");
 const execFileAsync = promisify(execFile);
@@ -761,6 +776,45 @@ async function editTelegramMessageText(token, chatId, messageId, text, replyMark
   }
 }
 
+const SLASH_COMMAND_ALIASES = {
+  "/start": "帮助",
+  "/help": "帮助",
+  "/status": "状态",
+  "/settings": "设置",
+  "/boarded": "上车了",
+  "/mute": "暂停",
+  "/resume": "恢复",
+};
+
+function normalizeSlashCommand(text) {
+  if (!text.startsWith("/")) {
+    return text;
+  }
+  const bare = text.split(/\s+/)[0].split("@")[0].toLowerCase();
+  return SLASH_COMMAND_ALIASES[bare] || text;
+}
+
+async function registerBotCommands(token) {
+  const commands = [
+    { command: "status", description: "🚏 查看当前到站情况" },
+    { command: "settings", description: "⚙️ 设置站点、线路、提醒时间" },
+    { command: "boarded", description: "🛑 我上车了（本时段不再提醒）" },
+    { command: "mute", description: "🔕 今天暂停提醒" },
+    { command: "resume", description: "🔔 恢复提醒" },
+  ];
+
+  const response = await fetch(`https://api.telegram.org/bot${token}/setMyCommands`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ commands }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    throw new Error(`setMyCommands failed: ${response.status} ${response.statusText}`);
+  }
+}
+
 async function fetchTelegramUpdates(token, offset, timeoutSeconds = 0) {
   const params = new URLSearchParams({ timeout: String(timeoutSeconds) });
   if (typeof offset === "number") {
@@ -848,53 +902,6 @@ function buildStatusMessage(items, timeZone, stops, weatherSummary = null, muteS
   lines.push("");
   lines.push(`更新时间：${formatArrivalClock(new Date().toISOString(), timeZone)}`);
   lines.push(buildAvailableCommandsHint(stops));
-  return lines.join("\n");
-}
-
-function buildConfigMessage(stops, state, defaultThresholdMinutes) {
-  const lines = ["⚙️ 当前配置", ""];
-  const walkByStop = state.walkMinutesByStop || {};
-
-  for (const stop of stops) {
-    const periodSuffix =
-      Array.isArray(stop.periods) && stop.periods.length > 0
-        ? `｜仅${stop.periods.join("、")}高峰`
-        : "";
-    lines.push(`📍 ${stop.stop_name} (${stop.stop_id})${periodSuffix}`);
-    if (Number.isFinite(walkByStop[stop.stop_id])) {
-      lines.push(`   🚶 步行 ${walkByStop[stop.stop_id]} 分钟`);
-    }
-    if (!Array.isArray(stop.services) || stop.services.length === 0) {
-      lines.push("   暂无监控线路");
-    } else {
-      for (const serviceNo of stop.services) {
-        const threshold = getServiceThresholdMinutes(state, defaultThresholdMinutes, serviceNo);
-        lines.push(`   🚌 ${serviceNo}｜提醒阈值 ${threshold} 分钟`);
-      }
-    }
-    lines.push("");
-  }
-
-  if (Number.isFinite(state.walkMinutesDefault)) {
-    lines.push(`🚶 默认步行时间：${state.walkMinutesDefault} 分钟（出门提醒已开启）`);
-  } else if (Object.keys(walkByStop).length > 0) {
-    lines.push("🚶 出门提醒：仅对已设置步行时间的站点开启");
-  } else {
-    lines.push("🚶 出门提醒未开启（发送：步行 <分钟>）");
-  }
-  lines.push("");
-
-  lines.push("可用命令：");
-  lines.push("添加站点 <ID> <名称>");
-  lines.push("删除站点 <ID>");
-  lines.push("添加线路 <线路号> <站点ID/名称>");
-  lines.push("删除线路 <线路号> <站点ID/名称>");
-  lines.push("阈值 <线路号> <分钟>");
-  lines.push("步行 <分钟> / 步行 <站点ID> <分钟> / 步行 关");
-  lines.push("设置时段 <站点ID> 早|晚|全部");
-  lines.push("重命名 <站点ID> <名称>");
-  lines.push("");
-  lines.push("加新站点：直接发位置或粘贴 Google 地图链接");
   return lines.join("\n");
 }
 
@@ -1470,6 +1477,265 @@ async function handleAddServiceCallback(context, message, callbackQuery, stopId,
   await answerTelegramCallbackQuery(token, callbackQuery.id, `已添加 ${serviceNo}`);
 }
 
+async function fetchStopServiceNumbers(context, stopId) {
+  try {
+    const arrivalData = await fetchArrivalsCached(context.apiBase, stopId, context.runCache);
+    return (arrivalData.services || []).map((service) => service.no).sort();
+  } catch (error) {
+    logInfo(`service discovery failed for ${stopId}: ${describeError(error)}`);
+    return [];
+  }
+}
+
+// Menus live in a single message that is edited as the user navigates; only the
+// entry point (⚙️ 设置) creates a new one.
+async function showMenuScreen(context, message, screen, { asNewMessage = false } = {}) {
+  const { token, chatId } = context;
+
+  if (asNewMessage) {
+    await sendTelegramMessage(token, {
+      chat_id: chatId,
+      text: screen.text,
+      disable_web_page_preview: true,
+      reply_markup: screen.replyMarkup,
+    });
+    return;
+  }
+
+  await editTelegramMessageText(
+    token,
+    chatId,
+    message.message_id,
+    screen.text,
+    screen.replyMarkup,
+  );
+}
+
+async function handleMenuCallback(context, message, callbackQuery, parsed) {
+  const { token, state, stops, timeZone, alertWindows, defaultThresholdMinutes } = context;
+  const { action, args } = parsed;
+  const findStop = (stopId) => stops.find((stop) => stop.stop_id === stopId);
+  let notice = "";
+
+  const openStopScreen = async (stopId) => {
+    const stop = findStop(stopId);
+    if (!stop) {
+      await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+      return;
+    }
+    await showMenuScreen(context, message, buildStopMenu(stop, state, defaultThresholdMinutes));
+  };
+
+  switch (action) {
+    case "main":
+      // Reached from the ⚙️ button on a status or alert message, which is either
+      // live-refreshing or worth keeping, so the menu starts its own message.
+      await showMenuScreen(
+        context,
+        message,
+        buildMainMenu(stops, state, defaultThresholdMinutes),
+        { asNewMessage: true },
+      );
+      break;
+
+    case "back":
+      await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+      break;
+
+    case "stop":
+      await openStopScreen(args[0]);
+      break;
+
+    case "routes": {
+      const stop = findStop(args[0]);
+      if (!stop) {
+        await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+        break;
+      }
+      const services = await fetchStopServiceNumbers(context, stop.stop_id);
+      await showMenuScreen(context, message, buildRoutesMenu(stop, services));
+      break;
+    }
+
+    case "svcadd":
+    case "svcdel": {
+      const stop = findStop(args[0]);
+      const serviceNo = args[1];
+      if (!stop || !isValidServiceNo(serviceNo)) {
+        await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+        break;
+      }
+      if (action === "svcadd") {
+        stop.services = Array.from(new Set([...(stop.services || []), serviceNo])).sort();
+        notice = `已添加 ${serviceNo}`;
+      } else {
+        stop.services = (stop.services || []).filter((item) => item !== serviceNo);
+        notice = `已移除 ${serviceNo}`;
+      }
+      state.monitoredStops = cloneStops(stops);
+      logInfo(`${action} ${serviceNo} @ ${stop.stop_id}`);
+      const services = await fetchStopServiceNumbers(context, stop.stop_id);
+      await showMenuScreen(context, message, buildRoutesMenu(stop, services));
+      break;
+    }
+
+    case "thr": {
+      const stop = findStop(args[0]);
+      if (!stop) {
+        await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+        break;
+      }
+      await showMenuScreen(
+        context,
+        message,
+        buildThresholdServiceMenu(stop, state, defaultThresholdMinutes),
+      );
+      break;
+    }
+
+    case "thrpick": {
+      const stop = findStop(args[0]);
+      const serviceNo = args[1];
+      if (!stop) {
+        await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+        break;
+      }
+      const current = getStopThresholdLines(stop, state, defaultThresholdMinutes).find(
+        (row) => row.serviceNo === serviceNo,
+      );
+      await showMenuScreen(
+        context,
+        message,
+        buildThresholdValueMenu(stop, serviceNo, current?.minutes ?? defaultThresholdMinutes),
+      );
+      break;
+    }
+
+    case "thrset": {
+      const stop = findStop(args[0]);
+      const serviceNo = args[1];
+      const minutes = Number(args[2]);
+      if (!stop || !isValidServiceNo(serviceNo) || !Number.isFinite(minutes)) {
+        await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+        break;
+      }
+      state.serviceThresholdMinutes = {
+        ...(state.serviceThresholdMinutes || {}),
+        [serviceNo]: minutes,
+      };
+      notice = `${serviceNo} 改为提前 ${minutes} 分钟`;
+      logInfo(`threshold ${serviceNo} = ${minutes}m`);
+      await showMenuScreen(context, message, buildThresholdValueMenu(stop, serviceNo, minutes));
+      break;
+    }
+
+    case "period": {
+      const stop = findStop(args[0]);
+      if (!stop) {
+        await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+        break;
+      }
+      await showMenuScreen(context, message, buildPeriodMenu(stop));
+      break;
+    }
+
+    case "periodset": {
+      const stop = findStop(args[0]);
+      const period = args[1];
+      if (!stop || !["早", "晚", "全部"].includes(period)) {
+        await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+        break;
+      }
+      if (period === "全部") {
+        delete stop.periods;
+      } else {
+        stop.periods = [period];
+      }
+      state.monitoredStops = cloneStops(stops);
+      notice = period === "全部" ? "早晚都提醒" : `只在${period}高峰提醒`;
+      logInfo(`period ${stop.stop_id} = ${period}`);
+      await showMenuScreen(context, message, buildPeriodMenu(stop));
+      break;
+    }
+
+    case "walk":
+      await showMenuScreen(context, message, buildWalkMenu(state));
+      break;
+
+    case "walkset": {
+      const minutes = Number(args[0]);
+      if (minutes > 0) {
+        state.walkMinutesDefault = minutes;
+        notice = `步行 ${minutes} 分钟`;
+      } else {
+        delete state.walkMinutesDefault;
+        delete state.walkMinutesByStop;
+        notice = "出门提醒已关闭";
+      }
+      logInfo(`walk default = ${minutes || "off"}`);
+      await showMenuScreen(context, message, buildWalkMenu(state));
+      break;
+    }
+
+    case "add":
+      await showMenuScreen(context, message, buildAddStopMenu());
+      break;
+
+    case "rename": {
+      const stop = findStop(args[0]);
+      if (!stop) {
+        await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+        break;
+      }
+      await sendTelegramMessage(token, {
+        chat_id: context.chatId,
+        text: buildRenamePrompt(stop),
+        reply_markup: { force_reply: true },
+      });
+      notice = "请回复新名字";
+      break;
+    }
+
+    case "del": {
+      const stop = findStop(args[0]);
+      if (!stop) {
+        await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+        break;
+      }
+      await showMenuScreen(context, message, buildDeleteConfirmMenu(stop));
+      break;
+    }
+
+    case "delok": {
+      const index = stops.findIndex((stop) => stop.stop_id === args[0]);
+      if (index !== -1) {
+        const [removed] = stops.splice(index, 1);
+        state.monitoredStops = cloneStops(stops);
+        notice = `已删除 ${removed.stop_name}`;
+        logInfo(`stop ${removed.stop_id} deleted`);
+      }
+      await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+      break;
+    }
+
+    case "close":
+      await editTelegramMessageText(
+        token,
+        context.chatId,
+        message.message_id,
+        "⚙️ 设置已关闭",
+        buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
+      );
+      break;
+
+    default:
+      await showMenuScreen(context, message, buildMainMenu(stops, state, defaultThresholdMinutes));
+      break;
+  }
+
+  await answerTelegramCallbackQuery(token, callbackQuery.id, notice);
+}
+
 async function processTelegramCommands(context, pollSeconds) {
   const {
     token,
@@ -1504,9 +1770,45 @@ async function processTelegramCommands(context, pollSeconds) {
       continue;
     }
 
-    let text = (message.text || "").trim();
+    // A reply to the rename prompt carries the stop id in the quoted text, so no
+    // pending-operation state has to survive across restarts.
+    const renameTargetId = !callbackQuery
+      ? parseRenamePrompt(update.message?.reply_to_message?.text)
+      : null;
+    if (renameTargetId) {
+      const newName = (message.text || "").trim();
+      const renameStop = stops.find((stop) => stop.stop_id === renameTargetId);
+      let replyText;
+      if (!renameStop) {
+        replyText = `站点 ${renameTargetId} 已不在监控中。`;
+      } else if (!isValidStopName(newName)) {
+        replyText = "名称无效，请控制在 80 字以内且不要换行。";
+      } else {
+        const previousName = renameStop.stop_name;
+        renameStop.stop_name = newName;
+        state.monitoredStops = cloneStops(stops);
+        replyText = `✅ 已改名：${previousName} → ${newName}`;
+        logInfo(`stop ${renameTargetId} renamed`);
+      }
+
+      await sendTelegramMessage(token, {
+        chat_id: chatId,
+        text: replyText,
+        reply_to_message_id: message.message_id,
+        disable_web_page_preview: true,
+        reply_markup: buildMainMenu(stops, state, defaultThresholdMinutes).replyMarkup,
+      });
+      continue;
+    }
+
+    let text = normalizeSlashCommand((message.text || "").trim());
     if (callbackQuery) {
       const data = String(callbackQuery.data || "");
+      const menuCallback = parseMenuCallback(data);
+      if (menuCallback) {
+        await handleMenuCallback(context, message, callbackQuery, menuCallback);
+        continue;
+      }
       if (data.startsWith("addstop:")) {
         await handleAddStopCallback(context, message, callbackQuery, data.slice("addstop:".length));
         continue;
@@ -1670,27 +1972,15 @@ async function processTelegramCommands(context, pollSeconds) {
         });
       }
       continue;
-    } else if (text === "配置") {
-      if (callbackQuery) {
-        await editTelegramMessageText(
-          token,
-          chatId,
-          message.message_id,
-          buildConfigMessage(stops, state, defaultThresholdMinutes),
-          buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
-        );
-      } else {
-        await sendTelegramMessage(token, {
-          chat_id: chatId,
-          text: buildConfigMessage(stops, state, defaultThresholdMinutes),
-          reply_to_message_id: message.message_id,
-          disable_web_page_preview: true,
-          reply_markup: buildTelegramButtons(stops, isProactiveMutedNow(state, timeZone, alertWindows)),
-        });
-      }
-      if (callbackQuery) {
-        await answerTelegramCallbackQuery(token, callbackQuery.id);
-      }
+    } else if (text === "配置" || text === "设置" || text === "菜单") {
+      const menu = buildMainMenu(stops, state, defaultThresholdMinutes);
+      await sendTelegramMessage(token, {
+        chat_id: chatId,
+        text: menu.text,
+        reply_to_message_id: message.message_id,
+        disable_web_page_preview: true,
+        reply_markup: menu.replyMarkup,
+      });
       continue;
     } else if (text === "状态" || text.toLowerCase() === "status") {
       requestedServices = null;
@@ -2263,6 +2553,12 @@ async function main() {
     logInfo(
       `daemon started, windows=${alertWindows.map((w) => `${w.start}-${w.end}`).join(",")}, timezone=${timeZone}`,
     );
+
+    try {
+      await registerBotCommands(token);
+    } catch (error) {
+      logInfo(`bot command registration skipped: ${describeError(error)}`);
+    }
 
     do {
       let cycleFailed = false;

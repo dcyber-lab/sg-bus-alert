@@ -44,9 +44,12 @@ test("buildTelegramButtons reflects current monitored services with a practical 
     { text: "🚌 51", callback_data: "status_service:51" },
     { text: "🚌 52", callback_data: "status_service:52" },
   ]);
-  assert.deepEqual(replyMarkup.inline_keyboard.at(-1), [
+  assert.deepEqual(replyMarkup.inline_keyboard.at(-2), [
     { text: "🛑 我上车了", callback_data: "boarded" },
     { text: "🔕 暂停今天", callback_data: "mute" },
+  ]);
+  assert.deepEqual(replyMarkup.inline_keyboard.at(-1), [
+    { text: "⚙️ 设置", callback_data: "m:main" },
   ]);
   assert.equal(
     buildAvailableCommandsHint(stops),

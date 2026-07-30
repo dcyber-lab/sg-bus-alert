@@ -1,0 +1,177 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  buildDeleteConfirmMenu,
+  buildMainMenu,
+  buildPeriodMenu,
+  buildRenamePrompt,
+  buildRoutesMenu,
+  buildStopMenu,
+  buildThresholdServiceMenu,
+  buildThresholdValueMenu,
+  buildWalkMenu,
+  describeStopPeriod,
+  getStopWalkMinutes,
+  parseMenuCallback,
+  parseRenamePrompt,
+} from "../lib/menu.mjs";
+
+const STOPS = [
+  { stop_id: "17379", stop_name: "金文泰大牌304", services: ["189"] },
+  { stop_id: "17051", stop_name: "丽晶园对面", services: ["963"], periods: ["晚"] },
+];
+
+function allButtons(replyMarkup) {
+  return replyMarkup.inline_keyboard.flat();
+}
+
+function callbackDataOf(replyMarkup) {
+  return allButtons(replyMarkup).map((button) => button.callback_data);
+}
+
+test("every menu keeps callback_data within Telegram's 64-byte limit", () => {
+  const state = { serviceThresholdMinutes: { "189": 6 }, walkMinutesDefault: 5 };
+  const menus = [
+    buildMainMenu(STOPS, state, 8),
+    buildStopMenu(STOPS[0], state, 8),
+    buildRoutesMenu(STOPS[0], ["52", "61", "154", "189"]),
+    buildThresholdServiceMenu(STOPS[0], state, 8),
+    buildThresholdValueMenu(STOPS[0], "189", 6),
+    buildPeriodMenu(STOPS[1]),
+    buildWalkMenu(state),
+    buildDeleteConfirmMenu(STOPS[0]),
+  ];
+
+  for (const menu of menus) {
+    assert.ok(menu.text.length > 0);
+    for (const data of callbackDataOf(menu.replyMarkup)) {
+      assert.ok(
+        Buffer.byteLength(data, "utf8") <= 64,
+        `callback_data too long: ${data} (${Buffer.byteLength(data, "utf8")} bytes)`,
+      );
+    }
+  }
+});
+
+test("main menu lists one button per stop plus the global actions", () => {
+  const menu = buildMainMenu(STOPS, { walkMinutesDefault: 5 }, 8);
+
+  assert.match(menu.text, /金文泰大牌304 \(17379\)/);
+  assert.match(menu.text, /提前 8 分钟提醒/);
+  assert.match(menu.text, /只晚高峰/);
+  assert.deepEqual(callbackDataOf(menu.replyMarkup), [
+    "m:stop:17379",
+    "m:stop:17051",
+    "m:add",
+    "m:walk",
+    "m:close",
+  ]);
+});
+
+test("main menu guides the user when nothing is monitored yet", () => {
+  const menu = buildMainMenu([], {}, 8);
+
+  assert.match(menu.text, /还没有监控任何站点/);
+  assert.deepEqual(callbackDataOf(menu.replyMarkup), ["m:add", "m:walk", "m:close"]);
+});
+
+test("routes menu offers removal for monitored and addition for the rest", () => {
+  const menu = buildRoutesMenu(STOPS[0], ["52", "189", "61"]);
+
+  assert.match(menu.text, /已监控：189/);
+  assert.deepEqual(callbackDataOf(menu.replyMarkup), [
+    "m:svcdel:17379:189",
+    "m:svcadd:17379:52",
+    "m:svcadd:17379:61",
+    "m:stop:17379",
+  ]);
+});
+
+test("routes menu caps how many addable services become buttons", () => {
+  const many = Array.from({ length: 30 }, (_, index) => `S${index}`);
+  const menu = buildRoutesMenu({ stop_id: "1", stop_name: "X", services: [] }, many);
+  const addButtons = callbackDataOf(menu.replyMarkup).filter((data) => data.startsWith("m:svcadd:"));
+
+  assert.equal(addButtons.length, 12);
+});
+
+test("threshold menus mark the current value and route back correctly", () => {
+  const state = { serviceThresholdMinutes: { "189": 6 } };
+  const picker = buildThresholdServiceMenu(STOPS[0], state, 8);
+  assert.deepEqual(callbackDataOf(picker.replyMarkup), [
+    "m:thrpick:17379:189",
+    "m:stop:17379",
+  ]);
+
+  const values = buildThresholdValueMenu(STOPS[0], "189", 6);
+  const selected = allButtons(values.replyMarkup).filter((button) => button.text.startsWith("✅"));
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].callback_data, "m:thrset:17379:189:6");
+});
+
+test("threshold picker tells the user to add a route first when there is none", () => {
+  const menu = buildThresholdServiceMenu({ stop_id: "1", stop_name: "X", services: [] }, {}, 8);
+
+  assert.match(menu.text, /还没有监控线路/);
+  assert.deepEqual(callbackDataOf(menu.replyMarkup), ["m:stop:1"]);
+});
+
+test("walk menu reflects the configured default and can switch off", () => {
+  const off = buildWalkMenu({});
+  assert.match(off.text, /未开启/);
+  assert.ok(callbackDataOf(off.replyMarkup).includes("m:walkset:0"));
+
+  const on = buildWalkMenu({ walkMinutesDefault: 5 });
+  assert.match(on.text, /步行 5 分钟/);
+  const selected = allButtons(on.replyMarkup).filter((button) => button.text.startsWith("✅"));
+  assert.deepEqual(
+    selected.map((button) => button.callback_data),
+    ["m:walkset:5"],
+  );
+});
+
+test("period helpers describe and offer the three choices", () => {
+  assert.equal(describeStopPeriod(STOPS[0]), "全部时段");
+  assert.equal(describeStopPeriod(STOPS[1]), "只晚高峰");
+
+  const menu = buildPeriodMenu(STOPS[1]);
+  assert.deepEqual(callbackDataOf(menu.replyMarkup), [
+    "m:periodset:17051:早",
+    "m:periodset:17051:晚",
+    "m:periodset:17051:全部",
+    "m:stop:17051",
+  ]);
+});
+
+test("delete confirmation names the collateral services", () => {
+  const menu = buildDeleteConfirmMenu(STOPS[0]);
+
+  assert.match(menu.text, /线路 189 也会一并移除/);
+  assert.deepEqual(callbackDataOf(menu.replyMarkup), ["m:delok:17379", "m:stop:17379"]);
+});
+
+test("getStopWalkMinutes prefers a per-stop override over the default", () => {
+  const state = { walkMinutesDefault: 5, walkMinutesByStop: { "17379": 9 } };
+
+  assert.deepEqual(getStopWalkMinutes(STOPS[0], state), { minutes: 9, source: "stop" });
+  assert.deepEqual(getStopWalkMinutes(STOPS[1], state), { minutes: 5, source: "default" });
+  assert.deepEqual(getStopWalkMinutes(STOPS[0], {}), { minutes: null, source: "none" });
+});
+
+test("rename prompt round-trips the stop id so the reply needs no stored state", () => {
+  const prompt = buildRenamePrompt(STOPS[0]);
+
+  assert.equal(parseRenamePrompt(prompt), "17379");
+  assert.equal(parseRenamePrompt("随便一句话"), null);
+});
+
+test("parseMenuCallback splits action and arguments, ignoring other callbacks", () => {
+  assert.deepEqual(parseMenuCallback("m:stop:17379"), { action: "stop", args: ["17379"] });
+  assert.deepEqual(parseMenuCallback("m:thrset:17379:189:6"), {
+    action: "thrset",
+    args: ["17379", "189", "6"],
+  });
+  assert.deepEqual(parseMenuCallback("m:main"), { action: "main", args: [] });
+  assert.equal(parseMenuCallback("status_all"), null);
+});

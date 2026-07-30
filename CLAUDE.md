@@ -21,7 +21,8 @@ This is a small local automation project for Singapore bus alerts on Telegram.
 
 - Long-lived daemon (`systemd --user` service, `Restart=always`), Telegram long polling: 20s idle, 5s during windows; the old 10s timer is gone
 - `index.mjs`: all runtime logic (daemon loop `main` + `proactiveTick` + command handling)
-- `lib/runtime-helpers.mjs` + `lib/state-store.mjs` + `lib/location.mjs`: tested helpers, SQLite state store, map-link/coordinate parsing
+- `lib/runtime-helpers.mjs` + `lib/state-store.mjs` + `lib/location.mjs` + `lib/menu.mjs`: tested helpers, SQLite state store, map-link parsing, button menu screens
+- Settings are button-driven (`m:*` callbacks), rendered into ONE message that is edited as the user navigates; `m:main` opens a new menu message, `m:back` re-renders in place
 - Stop coordinates from data.busrouter.sg, cached in `stops-cache.json` (30-day TTL, gitignored)
 - `.env`: local config, read once at startup — restart service after edits
 - `state.db`: SQLite state, persisted only when dirty
@@ -39,6 +40,8 @@ This is a small local automation project for Singapore bus alerts on Telegram.
 - Do not break `telegramUpdateOffset` (persisted via dirty-check after every cycle)
 - Do not break mute state (`mutedUntilDateKey`, `mutedWindowKeys`)
 - Do not break `windowNotices` / `departurePings` tracking — they prevent duplicate pushes
+- `callback_data` is capped at 64 bytes by Telegram; `test/menu.test.mjs` asserts every menu stays under it
+- The ⚙️ button on a live-refreshing window notice must open a NEW message — editing that notice would fight the refresh loop
 - Never run two pollers at once — Telegram `getUpdates` conflicts (409)
 - Keep `dns.setDefaultResultOrder("ipv4first")`: Telegram's IPv6 address is unreachable on this network and Node's fetch will not fall back on its own
 - Short-link resolution must stay restricted to Google hosts (`isResolvableShortLink`) and use manual redirects — a pasted link must never make the bot fetch an arbitrary address

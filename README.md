@@ -94,6 +94,25 @@ During a weekday alert window, when any monitored service has a bus within its t
 
 After the first send, no further messages are pushed for that window. The bot silently edits the same message every polling cycle so the ETAs stay current. When the window ends, the footer flips to `⏹ 本时段提醒已结束`. Evening windows use the `⏰ 晚间出行提醒` header. `alert_history` records one row per service per window.
 
+### Settings menu (button-driven)
+
+Configuration is done by tapping buttons, not by typing commands. `⚙️ 设置` (on every status/alert message), the text `设置` / `配置` / `菜单`, or `/settings` opens a menu that is edited in place as you navigate:
+
+```text
+⚙️ 设置 ──┬─ 📍 <stop> ──┬─ 🚌 管理线路   → ➕/➖ button per service at that stop
+          │              ├─ ⏱ 提醒时间   → pick service → 3/5/6/8/10/12 分钟
+          │              ├─ 🕐 提醒时段   → 🌅 只早高峰 / 🌆 只晚高峰 / 🔄 早晚都要
+          │              ├─ ✏️ 改名字     → force_reply, just type the new name
+          │              └─ 🗑 删除站点   → confirmation step
+          ├─ ➕ 添加站点  → share a location / paste a Maps link
+          ├─ 🚶 出门提醒  → 2/3/4/5/6/8/10 分钟 or off
+          └─ ❌ 关闭
+```
+
+The whole menu lives in one message, so navigating never leaves a trail. Renaming uses `force_reply` and recovers the target stop id from the quoted prompt, so no pending-operation state has to survive a restart.
+
+`/status`, `/settings`, `/boarded`, `/mute` and `/resume` are registered via `setMyCommands`, so they show up in Telegram's command menu.
+
 ### Telegram commands
 
 - `状态`
@@ -102,8 +121,10 @@ After the first send, no further messages are pushed for that window. The bot si
   - show monitored buses and next 3 arrivals
 - `<线路号>`
   - show that monitored service only
-- `配置`
-  - show current monitored stops, services, and effective thresholds
+- `配置` / `设置` / `菜单`
+  - open the button-driven settings menu described above
+
+The text commands below still work, but everything they do is also reachable from the menu:
 - `添加线路 190`
   - add a service into current monitored stop config
   - if there are multiple candidate stops, specify the stop explicitly
