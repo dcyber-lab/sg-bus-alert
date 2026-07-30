@@ -288,6 +288,7 @@ curl -fsSL -X POST "https://api.telegram.org/bot<token>/sendMessage" \
 
 Important implementation detail:
 
+- `api.telegram.org` publishes an AAAA record that this network cannot reach; Node's `fetch` does not fall back to IPv4 the way `curl` does, which showed up as recurring `fetch failed (ETIMEDOUT)` cycles. `index.mjs` calls `dns.setDefaultResultOrder("ipv4first")` at startup to avoid it — keep that line.
 - this project uses long polling via `getUpdates` (20s idle, 5s during alert windows)
 - no webhook is configured
 - proactive checks tick roughly every 10 seconds during alert windows

@@ -3,9 +3,14 @@
 import fs from "node:fs/promises";
 import { unlinkSync } from "node:fs";
 import { execFile } from "node:child_process";
+import dns from "node:dns";
 import path from "node:path";
 import process from "node:process";
 import { promisify } from "node:util";
+
+// api.telegram.org publishes AAAA records that this network cannot reach, and
+// undici does not fall back to IPv4 the way curl does.
+dns.setDefaultResultOrder("ipv4first");
 import {
   acquireRunLock,
   buildAvailableCommandsHint,
@@ -86,6 +91,11 @@ function sleep(ms) {
 
 function logInfo(message) {
   console.log(`[sg-bus-alert] ${message}`);
+}
+
+function describeError(error) {
+  const cause = error?.cause?.code || error?.cause?.message;
+  return cause ? `${error.message} (${cause})` : String(error?.message || error);
 }
 
 function isIgnorableTelegramError(message) {
@@ -1941,12 +1951,12 @@ async function main() {
       } catch (error) {
         cycleFailed = true;
         state.failureStreak = (Number.isFinite(state.failureStreak) ? state.failureStreak : 0) + 1;
-        logInfo(`cycle failed (streak=${state.failureStreak}): ${error.message}`);
+        logInfo(`cycle failed (streak=${state.failureStreak}): ${describeError(error)}`);
         if (state.failureStreak === failureAlertAfter) {
           try {
             await sendTelegramMessage(token, {
               chat_id: chatId,
-              text: `⚠️ 机器人连续 ${failureAlertAfter} 次循环失败，请检查日志。\n最近错误：${error.message}`,
+              text: `⚠️ 机器人连续 ${failureAlertAfter} 次循环失败，请检查日志。\n最近错误：${describeError(error)}`,
               disable_web_page_preview: true,
             });
           } catch {

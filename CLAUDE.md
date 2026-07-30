@@ -38,5 +38,6 @@ This is a small local automation project for Singapore bus alerts on Telegram.
 - Do not break mute state (`mutedUntilDateKey`, `mutedWindowKeys`)
 - Do not break `windowNotices` / `departurePings` tracking — they prevent duplicate pushes
 - Never run two pollers at once — Telegram `getUpdates` conflicts (409)
+- Keep `dns.setDefaultResultOrder("ipv4first")`: Telegram's IPv6 address is unreachable on this network and Node's fetch will not fall back on its own
 - Weather failures should not break bus replies
 - `DEFAULT_SG_PUBLIC_HOLIDAYS` in `index.mjs` needs a yearly refresh
